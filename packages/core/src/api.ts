@@ -277,6 +277,53 @@ async function downloadFile(
   };
 }
 
+export interface MemoryItem {
+  id?: string;
+  content?: string;
+  enabled?: boolean;
+  created_at?: number;
+  updated_at?: number;
+}
+
+export interface CustomInstructions {
+  about_user?: string;
+  about_model?: string;
+  enabled_for_chat?: boolean;
+}
+
+export async function fetchMemories(session: ChatGPTSession): Promise<MemoryItem[]> {
+  const url = `${getApiBase()}/memories`;
+  const response = await fetchWithRetry(url, { headers: createHeaders(session) });
+  const data = await response.json();
+  // API returns { memories: [...] } or a direct array
+  return data.memories ?? data ?? [];
+}
+
+export async function fetchCustomInstructions(session: ChatGPTSession): Promise<CustomInstructions> {
+  const url = `${getApiBase()}/user_system_messages`;
+  const response = await fetchWithRetry(url, { headers: createHeaders(session) });
+  return response.json();
+}
+
+export function memoriesToMarkdown(memories: MemoryItem[]): string {
+  if (!memories.length) return '# ChatGPT Memories\n\n_No memories found._\n';
+  const lines = memories
+    .filter((m) => m.content)
+    .map((m) => {
+      const status = m.enabled === false ? ' _(disabled)_' : '';
+      return `- ${m.content}${status}`;
+    });
+  return `# ChatGPT Memories\n\n${lines.join('\n')}\n`;
+}
+
+export function customInstructionsToMarkdown(ci: CustomInstructions): string {
+  const sections: string[] = ['# Custom Instructions\n'];
+  if (ci.about_user) sections.push(`## About You\n\n${ci.about_user}\n`);
+  if (ci.about_model) sections.push(`## How You Want ChatGPT to Respond\n\n${ci.about_model}\n`);
+  if (!ci.about_user && !ci.about_model) sections.push('_No custom instructions set._\n');
+  return sections.join('\n');
+}
+
 /** Produce OpenAI-compatible conversations.json (array format Memory Forge expects). */
 export function toOpenAIExportFormat(conversations: Conversation[]): Conversation[] {
   return conversations.map((conv) => ({
@@ -285,11 +332,33 @@ export function toOpenAIExportFormat(conversations: Conversation[]): Conversatio
   }));
 }
 
-export function toMarkdownBundle(conversations: Conversation[]): Map<string, string> {
+export function toMarkdownBundle(
+  conversations: Conversation[],
+  fileMeta?: Map<string, { contentType: string; fileName?: string }>,
+): Map<string, string> {
+  // Build fileId -> extension map from downloaded file metadata
+  const fileExtMap = new Map<string, string>();
+  if (fileMeta) {
+    for (const [fileId, meta] of fileMeta) {
+      let ext = '';
+      if (meta.fileName) {
+        const dot = meta.fileName.lastIndexOf('.');
+        if (dot !== -1) ext = meta.fileName.slice(dot);
+      } else if (meta.contentType) {
+        const mime: Record<string, string> = {
+          'image/jpeg': '.jpeg', 'image/jpg': '.jpeg', 'image/png': '.png',
+          'image/gif': '.gif', 'image/webp': '.webp',
+        };
+        ext = mime[meta.contentType.split(';')[0].trim()] ?? '';
+      }
+      if (ext) fileExtMap.set(fileId, ext);
+    }
+  }
+
   const bundle = new Map<string, string>();
   for (const conv of conversations) {
     const id = conv.conversation_id ?? conv.id ?? 'unknown';
-    bundle.set(id, conversationToMarkdown(conv, { includeAllBranches: true }));
+    bundle.set(id, conversationToMarkdown(conv, { includeAllBranches: true, fileExtMap }));
   }
   return bundle;
 }

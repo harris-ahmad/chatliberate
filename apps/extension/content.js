@@ -191,13 +191,29 @@
     }
     return files;
   }
-  function extractMessageText(message) {
+  function extractPartText(p) {
+    if (typeof p.text === "string" && p.text.trim()) return p.text.trim();
+    if (typeof p.tether_id === "string") return "";
+    if (typeof p.summary === "string" && p.summary.trim()) return p.summary.trim();
+    return "";
+  }
+  function extractMessageText(message, fileExtMap = /* @__PURE__ */ new Map()) {
     const content = message.content;
     if (!content) return "";
+    const role = message.author?.role ?? "";
+    if (role === "tool" || role === "system") return "";
     if (content.content_type === "text" && Array.isArray(content.parts)) {
-      return content.parts.filter((p) => typeof p === "string").join("\n");
+      return content.parts.map((p) => typeof p === "string" ? p : extractPartText(p)).filter(Boolean).join("\n");
     }
     if (content.content_type === "code" && typeof content.text === "string") {
+      const trimmed = content.text.trim();
+      if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+        try {
+          JSON.parse(trimmed);
+          return "";
+        } catch {
+        }
+      }
       const lang = content.metadata?.language ?? "";
       return `\`\`\`${lang}
 ${content.text}
@@ -209,9 +225,11 @@ ${content.text}
         if (part && typeof part === "object") {
           const p = part;
           if (p.content_type === "image_asset_pointer" && p.asset_pointer) {
-            const id = String(p.asset_pointer).replace(/^(sediment|file-service):\/\//, "");
-            return `![image](files/${id})`;
+            const rawId = String(p.asset_pointer).replace(/^(sediment|file-service):\/\//, "");
+            const ext = fileExtMap.get(rawId) ?? "";
+            return `![image](../files/${rawId}${ext})`;
           }
+          return extractPartText(p);
         }
         return "";
       }).filter(Boolean).join("\n");
@@ -226,10 +244,10 @@ ${thoughts}
     }
     return "";
   }
-  function messageToMarkdown(message) {
+  function messageToMarkdown(message, fileExtMap = /* @__PURE__ */ new Map()) {
     const role = message.author?.role ?? "unknown";
-    if (role === "system") return "";
-    const text = extractMessageText(message);
+    if (role === "system" || role === "tool") return "";
+    const text = extractMessageText(message, fileExtMap);
     if (!text.trim()) return "";
     const label = role === "user" ? "**You**" : "**Assistant**";
     const time = message.create_time ? ` _(${formatDate(message.create_time)})_` : "";
@@ -242,28 +260,30 @@ ${text}
     const title = conversation.title ?? "Untitled";
     const id = conversation.conversation_id ?? conversation.id ?? "";
     const model = conversation.default_model_slug ?? "unknown";
-    const frontmatter = [
+    const frontmatterLines = [
       "---",
       `title: "${escapeYaml(title)}"`,
       `id: ${id}`,
       `create_time: ${formatDate(conversation.create_time)}`,
       `update_time: ${formatDate(conversation.update_time)}`,
       `model: ${model}`,
-      conversation.gizmo_id ? `project_id: ${conversation.gizmo_id}` : null,
-      "---",
-      ""
-    ].filter(Boolean).join("\n");
+      ...conversation.gizmo_id ? [`project_id: ${conversation.gizmo_id}`] : [],
+      "---"
+    ];
+    const frontmatter = frontmatterLines.join("\n") + "\n\n";
+    const fmap = options.fileExtMap ?? /* @__PURE__ */ new Map();
+    const toMd = (m) => messageToMarkdown(m, fmap);
     if (options.includeAllBranches) {
       const branches = getAllBranches(conversation);
       if (branches.length <= 1) {
         const path2 = getActivePath(conversation);
-        const body2 = path2.messages.map(messageToMarkdown).filter(Boolean).join("\n");
+        const body2 = path2.messages.map(toMd).filter(Boolean).join("\n");
         return frontmatter + `# ${title}
 
 ${body2}`;
       }
       const sections = branches.map((branch, i) => {
-        const body2 = branch.messages.map(messageToMarkdown).filter(Boolean).join("\n");
+        const body2 = branch.messages.map(toMd).filter(Boolean).join("\n");
         return `## Branch ${i + 1}
 
 ${body2}`;
@@ -275,10 +295,73 @@ _${branches.length} branches preserved_
 ${sections.join("\n\n---\n\n")}`;
     }
     const path = getActivePath(conversation);
-    const body = path.messages.map(messageToMarkdown).filter(Boolean).join("\n");
+    const body = path.messages.map(toMd).filter(Boolean).join("\n");
     return frontmatter + `# ${title}
 
 ${body}`;
+  }
+  function chunkMarkdown(md, maxCharsPerChunk = 32e4) {
+    if (md.length <= maxCharsPerChunk) return [md];
+    const chunks = [];
+    const parts = md.split(/(?=\n\*\*(?:You|Assistant)\*\*)/);
+    let current = "";
+    for (const part of parts) {
+      if ((current + part).length > maxCharsPerChunk && current.length > 0) {
+        chunks.push(current);
+        current = part;
+      } else {
+        current += part;
+      }
+    }
+    if (current) chunks.push(current);
+    return chunks;
+  }
+  function toContextBlock(conversations, opts = {}) {
+    const { maxChars = 6e4, label = "Previous conversation history", fileExtMap = /* @__PURE__ */ new Map() } = opts;
+    const imageFileIds = [];
+    const imgPattern = /!\[image\]\(\.\.\/files\/([^)]+)\)/g;
+    const lines = [`<${label}>`, ""];
+    let remaining = maxChars - label.length - 50;
+    for (const conv of conversations) {
+      const path = getActivePath(conv);
+      const title = conv.title ?? "Untitled";
+      const header = `### ${title}
+`;
+      const body = path.messages.map((m) => {
+        const role = m.author?.role === "user" ? "User" : "Assistant";
+        let text = extractMessageText(m, fileExtMap).trim();
+        if (!text) return "";
+        let match;
+        imgPattern.lastIndex = 0;
+        while ((match = imgPattern.exec(text)) !== null) {
+          imageFileIds.push(match[1]);
+        }
+        text = text.replace(imgPattern, "[image attached separately]");
+        return `${role}: ${text}`;
+      }).filter(Boolean).join("\n");
+      const entry = header + body + "\n\n";
+      if (entry.length > remaining) break;
+      lines.push(entry);
+      remaining -= entry.length;
+    }
+    if (imageFileIds.length > 0) {
+      const unique = [...new Set(imageFileIds)];
+      lines.push("---");
+      lines.push(`Note: This conversation contained ${unique.length} image(s). They are referenced as [image attached separately] above.`);
+      lines.push(`To include them, upload these files from the exported ZIP's "files/" folder:`);
+      for (const id of unique) {
+        lines.push(`  - files/${id}`);
+      }
+      lines.push("");
+    }
+    lines.push(`</${label}>`);
+    return lines.join("\n");
+  }
+  function obsidianFilename(conv) {
+    const date = conv.create_time ? new Date(Number(conv.create_time) * 1e3).toISOString().slice(0, 10) : "unknown";
+    const slug = (conv.title ?? "untitled").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
+    const id8 = (conv.conversation_id ?? conv.id ?? "").slice(0, 8);
+    return `${date} ${slug} ${id8}.md`;
   }
   var CONVERSATIONS_PER_PAGE = 28;
   async function exportAllConversations(session, options = {}) {
@@ -477,17 +560,72 @@ ${body}`;
       fileName: meta.file_name
     };
   }
+  async function fetchMemories(session) {
+    const url = `${getApiBase()}/memories`;
+    const response = await fetchWithRetry(url, { headers: createHeaders(session) });
+    const data = await response.json();
+    return data.memories ?? data ?? [];
+  }
+  async function fetchCustomInstructions(session) {
+    const url = `${getApiBase()}/user_system_messages`;
+    const response = await fetchWithRetry(url, { headers: createHeaders(session) });
+    return response.json();
+  }
+  function memoriesToMarkdown(memories) {
+    if (!memories.length) return "# ChatGPT Memories\n\n_No memories found._\n";
+    const lines = memories.filter((m) => m.content).map((m) => {
+      const status = m.enabled === false ? " _(disabled)_" : "";
+      return `- ${m.content}${status}`;
+    });
+    return `# ChatGPT Memories
+
+${lines.join("\n")}
+`;
+  }
+  function customInstructionsToMarkdown(ci) {
+    const sections = ["# Custom Instructions\n"];
+    if (ci.about_user) sections.push(`## About You
+
+${ci.about_user}
+`);
+    if (ci.about_model) sections.push(`## How You Want ChatGPT to Respond
+
+${ci.about_model}
+`);
+    if (!ci.about_user && !ci.about_model) sections.push("_No custom instructions set._\n");
+    return sections.join("\n");
+  }
   function toOpenAIExportFormat(conversations) {
     return conversations.map((conv) => ({
       ...conv,
       conversation_id: conv.conversation_id ?? conv.id
     }));
   }
-  function toMarkdownBundle(conversations) {
+  function toMarkdownBundle(conversations, fileMeta) {
+    const fileExtMap = /* @__PURE__ */ new Map();
+    if (fileMeta) {
+      for (const [fileId, meta] of fileMeta) {
+        let ext = "";
+        if (meta.fileName) {
+          const dot = meta.fileName.lastIndexOf(".");
+          if (dot !== -1) ext = meta.fileName.slice(dot);
+        } else if (meta.contentType) {
+          const mime = {
+            "image/jpeg": ".jpeg",
+            "image/jpg": ".jpeg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp"
+          };
+          ext = mime[meta.contentType.split(";")[0].trim()] ?? "";
+        }
+        if (ext) fileExtMap.set(fileId, ext);
+      }
+    }
     const bundle = /* @__PURE__ */ new Map();
     for (const conv of conversations) {
       const id = conv.conversation_id ?? conv.id ?? "unknown";
-      bundle.set(id, conversationToMarkdown(conv, { includeAllBranches: true }));
+      bundle.set(id, conversationToMarkdown(conv, { includeAllBranches: true, fileExtMap }));
     }
     return bundle;
   }
@@ -498,6 +636,713 @@ ${body}`;
       includeArchived: false,
       includeProjects: false
     });
+  }
+
+  // node_modules/fflate/esm/browser.js
+  var u8 = Uint8Array;
+  var u16 = Uint16Array;
+  var i32 = Int32Array;
+  var fleb = new u8([
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    2,
+    2,
+    3,
+    3,
+    3,
+    3,
+    4,
+    4,
+    4,
+    4,
+    5,
+    5,
+    5,
+    5,
+    0,
+    /* unused */
+    0,
+    0,
+    /* impossible */
+    0
+  ]);
+  var fdeb = new u8([
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    5,
+    5,
+    6,
+    6,
+    7,
+    7,
+    8,
+    8,
+    9,
+    9,
+    10,
+    10,
+    11,
+    11,
+    12,
+    12,
+    13,
+    13,
+    /* unused */
+    0,
+    0
+  ]);
+  var clim = new u8([16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]);
+  var freb = function(eb, start) {
+    var b = new u16(31);
+    for (var i = 0; i < 31; ++i) {
+      b[i] = start += 1 << eb[i - 1];
+    }
+    var r = new i32(b[30]);
+    for (var i = 1; i < 30; ++i) {
+      for (var j = b[i]; j < b[i + 1]; ++j) {
+        r[j] = j - b[i] << 5 | i;
+      }
+    }
+    return { b, r };
+  };
+  var _a = freb(fleb, 2);
+  var fl = _a.b;
+  var revfl = _a.r;
+  fl[28] = 258, revfl[258] = 28;
+  var _b = freb(fdeb, 0);
+  var fd = _b.b;
+  var revfd = _b.r;
+  var rev = new u16(32768);
+  for (i = 0; i < 32768; ++i) {
+    x = (i & 43690) >> 1 | (i & 21845) << 1;
+    x = (x & 52428) >> 2 | (x & 13107) << 2;
+    x = (x & 61680) >> 4 | (x & 3855) << 4;
+    rev[i] = ((x & 65280) >> 8 | (x & 255) << 8) >> 1;
+  }
+  var x;
+  var i;
+  var hMap = (function(cd, mb, r) {
+    var s = cd.length;
+    var i = 0;
+    var l = new u16(mb);
+    for (; i < s; ++i) {
+      if (cd[i])
+        ++l[cd[i] - 1];
+    }
+    var le = new u16(mb);
+    for (i = 1; i < mb; ++i) {
+      le[i] = le[i - 1] + l[i - 1] << 1;
+    }
+    var co;
+    if (r) {
+      co = new u16(1 << mb);
+      var rvb = 15 - mb;
+      for (i = 0; i < s; ++i) {
+        if (cd[i]) {
+          var sv = i << 4 | cd[i];
+          var r_1 = mb - cd[i];
+          var v = le[cd[i] - 1]++ << r_1;
+          for (var m = v | (1 << r_1) - 1; v <= m; ++v) {
+            co[rev[v] >> rvb] = sv;
+          }
+        }
+      }
+    } else {
+      co = new u16(s);
+      for (i = 0; i < s; ++i) {
+        if (cd[i]) {
+          co[i] = rev[le[cd[i] - 1]++] >> 15 - cd[i];
+        }
+      }
+    }
+    return co;
+  });
+  var flt = new u8(288);
+  for (i = 0; i < 144; ++i)
+    flt[i] = 8;
+  var i;
+  for (i = 144; i < 256; ++i)
+    flt[i] = 9;
+  var i;
+  for (i = 256; i < 280; ++i)
+    flt[i] = 7;
+  var i;
+  for (i = 280; i < 288; ++i)
+    flt[i] = 8;
+  var i;
+  var fdt = new u8(32);
+  for (i = 0; i < 32; ++i)
+    fdt[i] = 5;
+  var i;
+  var flm = /* @__PURE__ */ hMap(flt, 9, 0);
+  var fdm = /* @__PURE__ */ hMap(fdt, 5, 0);
+  var shft = function(p) {
+    return (p + 7) / 8 | 0;
+  };
+  var slc = function(v, s, e) {
+    if (s == null || s < 0)
+      s = 0;
+    if (e == null || e > v.length)
+      e = v.length;
+    return new u8(v.subarray(s, e));
+  };
+  var ec = [
+    "unexpected EOF",
+    "invalid block type",
+    "invalid length/literal",
+    "invalid distance",
+    "stream finished",
+    "no stream handler",
+    ,
+    // determined by compression function
+    "no callback",
+    "invalid UTF-8 data",
+    "extra field too long",
+    "date not in range 1980-2099",
+    "filename too long",
+    "stream finishing",
+    "invalid zip data"
+    // determined by unknown compression method
+  ];
+  var err = function(ind, msg, nt) {
+    var e = new Error(msg || ec[ind]);
+    e.code = ind;
+    if (Error.captureStackTrace)
+      Error.captureStackTrace(e, err);
+    if (!nt)
+      throw e;
+    return e;
+  };
+  var wbits = function(d, p, v) {
+    v <<= p & 7;
+    var o = p / 8 | 0;
+    d[o] |= v;
+    d[o + 1] |= v >> 8;
+  };
+  var wbits16 = function(d, p, v) {
+    v <<= p & 7;
+    var o = p / 8 | 0;
+    d[o] |= v;
+    d[o + 1] |= v >> 8;
+    d[o + 2] |= v >> 16;
+  };
+  var hTree = function(d, mb) {
+    var t = [];
+    for (var i = 0; i < d.length; ++i) {
+      if (d[i])
+        t.push({ s: i, f: d[i] });
+    }
+    var s = t.length;
+    var t2 = t.slice();
+    if (!s)
+      return { t: et, l: 0 };
+    if (s == 1) {
+      var v = new u8(t[0].s + 1);
+      v[t[0].s] = 1;
+      return { t: v, l: 1 };
+    }
+    t.sort(function(a, b) {
+      return a.f - b.f;
+    });
+    t.push({ s: -1, f: 25001 });
+    var l = t[0], r = t[1], i0 = 0, i1 = 1, i2 = 2;
+    t[0] = { s: -1, f: l.f + r.f, l, r };
+    while (i1 != s - 1) {
+      l = t[t[i0].f < t[i2].f ? i0++ : i2++];
+      r = t[i0 != i1 && t[i0].f < t[i2].f ? i0++ : i2++];
+      t[i1++] = { s: -1, f: l.f + r.f, l, r };
+    }
+    var maxSym = t2[0].s;
+    for (var i = 1; i < s; ++i) {
+      if (t2[i].s > maxSym)
+        maxSym = t2[i].s;
+    }
+    var tr = new u16(maxSym + 1);
+    var mbt = ln(t[i1 - 1], tr, 0);
+    if (mbt > mb) {
+      var i = 0, dt = 0;
+      var lft = mbt - mb, cst = 1 << lft;
+      t2.sort(function(a, b) {
+        return tr[b.s] - tr[a.s] || a.f - b.f;
+      });
+      for (; i < s; ++i) {
+        var i2_1 = t2[i].s;
+        if (tr[i2_1] > mb) {
+          dt += cst - (1 << mbt - tr[i2_1]);
+          tr[i2_1] = mb;
+        } else
+          break;
+      }
+      dt >>= lft;
+      while (dt > 0) {
+        var i2_2 = t2[i].s;
+        if (tr[i2_2] < mb)
+          dt -= 1 << mb - tr[i2_2]++ - 1;
+        else
+          ++i;
+      }
+      for (; i >= 0 && dt; --i) {
+        var i2_3 = t2[i].s;
+        if (tr[i2_3] == mb) {
+          --tr[i2_3];
+          ++dt;
+        }
+      }
+      mbt = mb;
+    }
+    return { t: new u8(tr), l: mbt };
+  };
+  var ln = function(n, l, d) {
+    return n.s == -1 ? Math.max(ln(n.l, l, d + 1), ln(n.r, l, d + 1)) : l[n.s] = d;
+  };
+  var lc = function(c) {
+    var s = c.length;
+    while (s && !c[--s])
+      ;
+    var cl = new u16(++s);
+    var cli = 0, cln = c[0], cls = 1;
+    var w = function(v) {
+      cl[cli++] = v;
+    };
+    for (var i = 1; i <= s; ++i) {
+      if (c[i] == cln && i != s)
+        ++cls;
+      else {
+        if (!cln && cls > 2) {
+          for (; cls > 138; cls -= 138)
+            w(32754);
+          if (cls > 2) {
+            w(cls > 10 ? cls - 11 << 5 | 28690 : cls - 3 << 5 | 12305);
+            cls = 0;
+          }
+        } else if (cls > 3) {
+          w(cln), --cls;
+          for (; cls > 6; cls -= 6)
+            w(8304);
+          if (cls > 2)
+            w(cls - 3 << 5 | 8208), cls = 0;
+        }
+        while (cls--)
+          w(cln);
+        cls = 1;
+        cln = c[i];
+      }
+    }
+    return { c: cl.subarray(0, cli), n: s };
+  };
+  var clen = function(cf, cl) {
+    var l = 0;
+    for (var i = 0; i < cl.length; ++i)
+      l += cf[i] * cl[i];
+    return l;
+  };
+  var wfblk = function(out, pos, dat) {
+    var s = dat.length;
+    var o = shft(pos + 2);
+    out[o] = s & 255;
+    out[o + 1] = s >> 8;
+    out[o + 2] = out[o] ^ 255;
+    out[o + 3] = out[o + 1] ^ 255;
+    for (var i = 0; i < s; ++i)
+      out[o + i + 4] = dat[i];
+    return (o + 4 + s) * 8;
+  };
+  var wblk = function(dat, out, final, syms, lf, df, eb, li, bs, bl, p) {
+    wbits(out, p++, final);
+    ++lf[256];
+    var _a2 = hTree(lf, 15), dlt = _a2.t, mlb = _a2.l;
+    var _b2 = hTree(df, 15), ddt = _b2.t, mdb = _b2.l;
+    var _c = lc(dlt), lclt = _c.c, nlc = _c.n;
+    var _d = lc(ddt), lcdt = _d.c, ndc = _d.n;
+    var lcfreq = new u16(19);
+    for (var i = 0; i < lclt.length; ++i)
+      ++lcfreq[lclt[i] & 31];
+    for (var i = 0; i < lcdt.length; ++i)
+      ++lcfreq[lcdt[i] & 31];
+    var _e = hTree(lcfreq, 7), lct = _e.t, mlcb = _e.l;
+    var nlcc = 19;
+    for (; nlcc > 4 && !lct[clim[nlcc - 1]]; --nlcc)
+      ;
+    var flen = bl + 5 << 3;
+    var ftlen = clen(lf, flt) + clen(df, fdt) + eb;
+    var dtlen = clen(lf, dlt) + clen(df, ddt) + eb + 14 + 3 * nlcc + clen(lcfreq, lct) + 2 * lcfreq[16] + 3 * lcfreq[17] + 7 * lcfreq[18];
+    if (bs >= 0 && flen <= ftlen && flen <= dtlen)
+      return wfblk(out, p, dat.subarray(bs, bs + bl));
+    var lm, ll, dm, dl;
+    wbits(out, p, 1 + (dtlen < ftlen)), p += 2;
+    if (dtlen < ftlen) {
+      lm = hMap(dlt, mlb, 0), ll = dlt, dm = hMap(ddt, mdb, 0), dl = ddt;
+      var llm = hMap(lct, mlcb, 0);
+      wbits(out, p, nlc - 257);
+      wbits(out, p + 5, ndc - 1);
+      wbits(out, p + 10, nlcc - 4);
+      p += 14;
+      for (var i = 0; i < nlcc; ++i)
+        wbits(out, p + 3 * i, lct[clim[i]]);
+      p += 3 * nlcc;
+      var lcts = [lclt, lcdt];
+      for (var it = 0; it < 2; ++it) {
+        var clct = lcts[it];
+        for (var i = 0; i < clct.length; ++i) {
+          var len = clct[i] & 31;
+          wbits(out, p, llm[len]), p += lct[len];
+          if (len > 15)
+            wbits(out, p, clct[i] >> 5 & 127), p += clct[i] >> 12;
+        }
+      }
+    } else {
+      lm = flm, ll = flt, dm = fdm, dl = fdt;
+    }
+    for (var i = 0; i < li; ++i) {
+      var sym = syms[i];
+      if (sym > 255) {
+        var len = sym >> 18 & 31;
+        wbits16(out, p, lm[len + 257]), p += ll[len + 257];
+        if (len > 7)
+          wbits(out, p, sym >> 23 & 31), p += fleb[len];
+        var dst = sym & 31;
+        wbits16(out, p, dm[dst]), p += dl[dst];
+        if (dst > 3)
+          wbits16(out, p, sym >> 5 & 8191), p += fdeb[dst];
+      } else {
+        wbits16(out, p, lm[sym]), p += ll[sym];
+      }
+    }
+    wbits16(out, p, lm[256]);
+    return p + ll[256];
+  };
+  var deo = /* @__PURE__ */ new i32([65540, 131080, 131088, 131104, 262176, 1048704, 1048832, 2114560, 2117632]);
+  var et = /* @__PURE__ */ new u8(0);
+  var dflt = function(dat, lvl, plvl, pre, post, st) {
+    var s = st.z || dat.length;
+    var o = new u8(pre + s + 5 * (1 + Math.ceil(s / 7e3)) + post);
+    var w = o.subarray(pre, o.length - post);
+    var lst = st.l;
+    var pos = (st.r || 0) & 7;
+    if (lvl) {
+      if (pos)
+        w[0] = st.r >> 3;
+      var opt = deo[lvl - 1];
+      var n = opt >> 13, c = opt & 8191;
+      var msk_1 = (1 << plvl) - 1;
+      var prev = st.p || new u16(32768), head = st.h || new u16(msk_1 + 1);
+      var bs1_1 = Math.ceil(plvl / 3), bs2_1 = 2 * bs1_1;
+      var hsh = function(i2) {
+        return (dat[i2] ^ dat[i2 + 1] << bs1_1 ^ dat[i2 + 2] << bs2_1) & msk_1;
+      };
+      var syms = new i32(25e3);
+      var lf = new u16(288), df = new u16(32);
+      var lc_1 = 0, eb = 0, i = st.i || 0, li = 0, wi = st.w || 0, bs = 0;
+      for (; i + 2 < s; ++i) {
+        var hv = hsh(i);
+        var imod = i & 32767, pimod = head[hv];
+        prev[imod] = pimod;
+        head[hv] = imod;
+        if (wi <= i) {
+          var rem = s - i;
+          if ((lc_1 > 7e3 || li > 24576) && (rem > 423 || !lst)) {
+            pos = wblk(dat, w, 0, syms, lf, df, eb, li, bs, i - bs, pos);
+            li = lc_1 = eb = 0, bs = i;
+            for (var j = 0; j < 286; ++j)
+              lf[j] = 0;
+            for (var j = 0; j < 30; ++j)
+              df[j] = 0;
+          }
+          var l = 2, d = 0, ch_1 = c, dif = imod - pimod & 32767;
+          if (rem > 2 && hv == hsh(i - dif)) {
+            var maxn = Math.min(n, rem) - 1;
+            var maxd = Math.min(32767, i);
+            var ml = Math.min(258, rem);
+            while (dif <= maxd && --ch_1 && imod != pimod) {
+              if (dat[i + l] == dat[i + l - dif]) {
+                var nl = 0;
+                for (; nl < ml && dat[i + nl] == dat[i + nl - dif]; ++nl)
+                  ;
+                if (nl > l) {
+                  l = nl, d = dif;
+                  if (nl > maxn)
+                    break;
+                  var mmd = Math.min(dif, nl - 2);
+                  var md = 0;
+                  for (var j = 0; j < mmd; ++j) {
+                    var ti = i - dif + j & 32767;
+                    var pti = prev[ti];
+                    var cd = ti - pti & 32767;
+                    if (cd > md)
+                      md = cd, pimod = ti;
+                  }
+                }
+              }
+              imod = pimod, pimod = prev[imod];
+              dif += imod - pimod & 32767;
+            }
+          }
+          if (d) {
+            syms[li++] = 268435456 | revfl[l] << 18 | revfd[d];
+            var lin = revfl[l] & 31, din = revfd[d] & 31;
+            eb += fleb[lin] + fdeb[din];
+            ++lf[257 + lin];
+            ++df[din];
+            wi = i + l;
+            ++lc_1;
+          } else {
+            syms[li++] = dat[i];
+            ++lf[dat[i]];
+          }
+        }
+      }
+      for (i = Math.max(i, wi); i < s; ++i) {
+        syms[li++] = dat[i];
+        ++lf[dat[i]];
+      }
+      pos = wblk(dat, w, lst, syms, lf, df, eb, li, bs, i - bs, pos);
+      if (!lst) {
+        st.r = pos & 7 | w[pos / 8 | 0] << 3;
+        pos -= 7;
+        st.h = head, st.p = prev, st.i = i, st.w = wi;
+      }
+    } else {
+      for (var i = st.w || 0; i < s + lst; i += 65535) {
+        var e = i + 65535;
+        if (e >= s) {
+          w[pos / 8 | 0] = lst;
+          e = s;
+        }
+        pos = wfblk(w, pos + 1, dat.subarray(i, e));
+      }
+      st.i = s;
+    }
+    return slc(o, 0, pre + shft(pos) + post);
+  };
+  var crct = /* @__PURE__ */ (function() {
+    var t = new Int32Array(256);
+    for (var i = 0; i < 256; ++i) {
+      var c = i, k = 9;
+      while (--k)
+        c = (c & 1 && -306674912) ^ c >>> 1;
+      t[i] = c;
+    }
+    return t;
+  })();
+  var crc = function() {
+    var c = -1;
+    return {
+      p: function(d) {
+        var cr = c;
+        for (var i = 0; i < d.length; ++i)
+          cr = crct[cr & 255 ^ d[i]] ^ cr >>> 8;
+        c = cr;
+      },
+      d: function() {
+        return ~c;
+      }
+    };
+  };
+  var dopt = function(dat, opt, pre, post, st) {
+    if (!st) {
+      st = { l: 1 };
+      if (opt.dictionary) {
+        var dict = opt.dictionary.subarray(-32768);
+        var newDat = new u8(dict.length + dat.length);
+        newDat.set(dict);
+        newDat.set(dat, dict.length);
+        dat = newDat;
+        st.w = dict.length;
+      }
+    }
+    return dflt(dat, opt.level == null ? 6 : opt.level, opt.mem == null ? st.l ? Math.ceil(Math.max(8, Math.min(13, Math.log(dat.length))) * 1.5) : 20 : 12 + opt.mem, pre, post, st);
+  };
+  var mrg = function(a, b) {
+    var o = {};
+    for (var k in a)
+      o[k] = a[k];
+    for (var k in b)
+      o[k] = b[k];
+    return o;
+  };
+  var wbytes = function(d, b, v) {
+    for (; v; ++b)
+      d[b] = v, v >>>= 8;
+  };
+  function deflateSync(data, opts) {
+    return dopt(data, opts || {}, 0, 0);
+  }
+  var fltn = function(d, p, t, o) {
+    for (var k in d) {
+      var val = d[k], n = p + k, op = o;
+      if (Array.isArray(val))
+        op = mrg(o, val[1]), val = val[0];
+      if (ArrayBuffer.isView(val))
+        t[n] = [val, op];
+      else {
+        t[n += "/"] = [new u8(0), op];
+        fltn(val, n, t, o);
+      }
+    }
+  };
+  var te = typeof TextEncoder != "undefined" && /* @__PURE__ */ new TextEncoder();
+  var td = typeof TextDecoder != "undefined" && /* @__PURE__ */ new TextDecoder();
+  var tds = 0;
+  try {
+    td.decode(et, { stream: true });
+    tds = 1;
+  } catch (e) {
+  }
+  function strToU8(str, latin1) {
+    if (latin1) {
+      var ar_1 = new u8(str.length);
+      for (var i = 0; i < str.length; ++i)
+        ar_1[i] = str.charCodeAt(i);
+      return ar_1;
+    }
+    if (te)
+      return te.encode(str);
+    var l = str.length;
+    var ar = new u8(str.length + (str.length >> 1));
+    var ai = 0;
+    var w = function(v) {
+      ar[ai++] = v;
+    };
+    for (var i = 0; i < l; ++i) {
+      if (ai + 5 > ar.length) {
+        var n = new u8(ai + 8 + (l - i << 1));
+        n.set(ar);
+        ar = n;
+      }
+      var c = str.charCodeAt(i);
+      if (c < 128 || latin1)
+        w(c);
+      else if (c < 2048)
+        w(192 | c >> 6), w(128 | c & 63);
+      else if (c > 55295 && c < 57344)
+        c = 65536 + (c & 1023 << 10) | str.charCodeAt(++i) & 1023, w(240 | c >> 18), w(128 | c >> 12 & 63), w(128 | c >> 6 & 63), w(128 | c & 63);
+      else
+        w(224 | c >> 12), w(128 | c >> 6 & 63), w(128 | c & 63);
+    }
+    return slc(ar, 0, ai);
+  }
+  var exfl = function(ex) {
+    var le = 0;
+    if (ex) {
+      for (var k in ex) {
+        var l = ex[k].length;
+        if (l > 65535)
+          err(9);
+        le += l + 4;
+      }
+    }
+    return le;
+  };
+  var wzh = function(d, b, f, fn, u, c, ce, co) {
+    var fl2 = fn.length, ex = f.extra, col = co && co.length;
+    var exl = exfl(ex);
+    wbytes(d, b, ce != null ? 33639248 : 67324752), b += 4;
+    if (ce != null)
+      d[b++] = 20, d[b++] = f.os;
+    d[b] = 20, b += 2;
+    d[b++] = f.flag << 1 | (c < 0 && 8), d[b++] = u && 8;
+    d[b++] = f.compression & 255, d[b++] = f.compression >> 8;
+    var dt = new Date(f.mtime == null ? Date.now() : f.mtime), y = dt.getFullYear() - 1980;
+    if (y < 0 || y > 119)
+      err(10);
+    wbytes(d, b, y << 25 | dt.getMonth() + 1 << 21 | dt.getDate() << 16 | dt.getHours() << 11 | dt.getMinutes() << 5 | dt.getSeconds() >> 1), b += 4;
+    if (c != -1) {
+      wbytes(d, b, f.crc);
+      wbytes(d, b + 4, c < 0 ? -c - 2 : c);
+      wbytes(d, b + 8, f.size);
+    }
+    wbytes(d, b + 12, fl2);
+    wbytes(d, b + 14, exl), b += 16;
+    if (ce != null) {
+      wbytes(d, b, col);
+      wbytes(d, b + 6, f.attrs);
+      wbytes(d, b + 10, ce), b += 14;
+    }
+    d.set(fn, b);
+    b += fl2;
+    if (exl) {
+      for (var k in ex) {
+        var exf = ex[k], l = exf.length;
+        wbytes(d, b, +k);
+        wbytes(d, b + 2, l);
+        d.set(exf, b + 4), b += 4 + l;
+      }
+    }
+    if (col)
+      d.set(co, b), b += col;
+    return b;
+  };
+  var wzf = function(o, b, c, d, e) {
+    wbytes(o, b, 101010256);
+    wbytes(o, b + 8, c);
+    wbytes(o, b + 10, c);
+    wbytes(o, b + 12, d);
+    wbytes(o, b + 16, e);
+  };
+  function zipSync(data, opts) {
+    if (!opts)
+      opts = {};
+    var r = {};
+    var files = [];
+    fltn(data, "", r, opts);
+    var o = 0;
+    var tot = 0;
+    for (var fn in r) {
+      var _a2 = r[fn], file = _a2[0], p = _a2[1];
+      var compression = p.level == 0 ? 0 : 8;
+      var f = strToU8(fn), s = f.length;
+      var com = p.comment, m = com && strToU8(com), ms = m && m.length;
+      var exl = exfl(p.extra);
+      if (s > 65535)
+        err(11);
+      var d = compression ? deflateSync(file, p) : file, l = d.length;
+      var c = crc();
+      c.p(file);
+      files.push(mrg(p, {
+        size: file.length,
+        crc: c.d(),
+        c: d,
+        f,
+        m,
+        u: s != fn.length || m && com.length != ms,
+        o,
+        compression
+      }));
+      o += 30 + s + exl + l;
+      tot += 76 + 2 * (s + exl) + (ms || 0) + l;
+    }
+    var out = new u8(tot + 22), oe = o, cdl = tot - o;
+    for (var i = 0; i < files.length; ++i) {
+      var f = files[i];
+      wzh(out, f.o, f, f.f, f.u, f.c.length);
+      var badd = 30 + f.f.length + exfl(f.extra);
+      out.set(f.c, f.o + badd);
+      wzh(out, o, f, f.f, f.u, f.c.length, f.o, f.m), o += 16 + badd + (f.m ? f.m.length : 0);
+    }
+    wzf(out, o, files.length, cdl, oe);
+    return out;
   }
 
   // apps/extension/src/content.js
@@ -513,110 +1358,83 @@ ${body}`;
     a.click();
     URL.revokeObjectURL(url);
   }
-  async function buildZip(result, options) {
+  async function buildZip(result, extras = {}) {
     const files = {};
     const oai = toOpenAIExportFormat(result.conversations);
     files["conversations.json"] = JSON.stringify(oai, null, 2);
-    const mdBundle = toMarkdownBundle(result.conversations);
+    const mdBundle = toMarkdownBundle(result.conversations, result.fileMeta);
     for (const [id, md] of mdBundle) {
       const conv = result.conversations.find((c) => (c.conversation_id ?? c.id) === id);
-      const name = (conv?.title ?? id).replace(/[<>:"/\\|?*]/g, "_").slice(0, 60);
-      files[`markdown/${name}_${id.slice(0, 8)}.md`] = md;
+      const fname = conv ? obsidianFilename(conv) : `${id.slice(0, 8)}.md`;
+      files[`markdown/${fname}`] = md;
+      const chunks = chunkMarkdown(md, 32e4);
+      if (chunks.length > 1) {
+        chunks.forEach((chunk, i) => {
+          files[`markdown/chunks/${fname.replace(".md", "")}-part${i + 1}.md`] = chunk;
+        });
+      }
     }
     for (const [fileId, data] of result.files) {
       const meta = result.fileMeta.get(fileId);
       const ext = meta?.fileName ? meta.fileName.split(".").pop() : "bin";
       files[`files/${fileId}.${ext}`] = data;
     }
+    if (extras.memories?.length) {
+      files["memory.json"] = JSON.stringify(extras.memories, null, 2);
+      files["memory.md"] = memoriesToMarkdown(extras.memories);
+    }
+    if (extras.customInstructions) {
+      files["custom-instructions.json"] = JSON.stringify(extras.customInstructions, null, 2);
+      files["custom-instructions.md"] = customInstructionsToMarkdown(extras.customInstructions);
+    }
+    const fileExtMap = /* @__PURE__ */ new Map();
+    for (const [fileId, meta] of result.fileMeta) {
+      let ext = "";
+      if (meta.fileName) {
+        const dot = meta.fileName.lastIndexOf(".");
+        if (dot !== -1) ext = meta.fileName.slice(dot);
+      } else if (meta.contentType) {
+        const mime = { "image/jpeg": ".jpeg", "image/jpg": ".jpeg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp" };
+        ext = mime[meta.contentType.split(";")[0].trim()] ?? "";
+      }
+      if (ext) fileExtMap.set(fileId, ext);
+    }
+    const contextBlock = toContextBlock(result.conversations, { maxChars: 6e4, fileExtMap });
+    files["import-context-for-claude-gemini.md"] = contextBlock;
     files["export-stats.json"] = JSON.stringify(
       {
         exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
         ...result.stats,
         tool: "chatliberate",
         version: "0.1.0",
-        accountType: document.cookie.includes("_account=") ? "teams/business" : "personal"
+        accountType: document.cookie.includes("_account=") ? "teams/business" : "personal",
+        memoriesCount: extras.memories?.length ?? 0,
+        hasCustomInstructions: Boolean(extras.customInstructions?.about_user || extras.customInstructions?.about_model)
       },
       null,
       2
     );
-    return createZip(files);
+    const zipInput = {};
+    for (const [name, content] of Object.entries(files)) {
+      zipInput[name] = typeof content === "string" ? strToU8(content) : content;
+    }
+    const zipped = zipSync(zipInput, { level: 0 });
+    return new Blob([zipped], { type: "application/zip" });
   }
-  function createZip(fileMap) {
-    const encoder = new TextEncoder();
-    const entries = [];
-    let offset = 0;
-    const chunks = [];
-    function crc32(data) {
-      let crc = 4294967295;
-      for (let i = 0; i < data.length; i++) {
-        crc ^= data[i];
-        for (let j = 0; j < 8; j++) {
-          crc = crc >>> 1 ^ (crc & 1 ? 3988292384 : 0);
-        }
-      }
-      return (crc ^ 4294967295) >>> 0;
-    }
-    for (const [name, content] of Object.entries(fileMap)) {
-      const nameBytes = encoder.encode(name);
-      const data = typeof content === "string" ? encoder.encode(content) : content;
-      const crc = crc32(data);
-      const local = new Uint8Array(30 + nameBytes.length);
-      const view = new DataView(local.buffer);
-      view.setUint32(0, 67324752, true);
-      view.setUint16(4, 20, true);
-      view.setUint16(26, nameBytes.length, true);
-      view.setUint32(18, crc, true);
-      view.setUint32(22, data.length, true);
-      view.setUint32(26, data.length, true);
-      local.set(nameBytes, 30);
-      const localOffset = offset;
-      chunks.push(local, data);
-      offset += local.length + data.length;
-      entries.push({ name, nameBytes, crc, size: data.length, offset: localOffset });
-    }
-    const centralStart = offset;
-    for (const entry of entries) {
-      const central = new Uint8Array(46 + entry.nameBytes.length);
-      const view = new DataView(central.buffer);
-      view.setUint32(0, 33639248, true);
-      view.setUint16(4, 20, true);
-      view.setUint16(6, 20, true);
-      view.setUint16(28, entry.nameBytes.length, true);
-      view.setUint32(16, entry.crc, true);
-      view.setUint32(20, entry.size, true);
-      view.setUint32(24, entry.size, true);
-      view.setUint32(42, entry.offset, true);
-      central.set(entry.nameBytes, 46);
-      chunks.push(central);
-      offset += central.length;
-    }
-    const end = new Uint8Array(22);
-    const endView = new DataView(end.buffer);
-    endView.setUint32(0, 101010256, true);
-    endView.setUint16(8, entries.length, true);
-    endView.setUint16(10, entries.length, true);
-    endView.setUint32(12, offset - centralStart, true);
-    endView.setUint32(16, centralStart, true);
-    chunks.push(end);
-    const total = chunks.reduce((sum, c) => sum + c.length, 0);
-    const out = new Uint8Array(total);
-    let pos = 0;
-    for (const chunk of chunks) {
-      out.set(chunk, pos);
-      pos += chunk.length;
-    }
-    return new Blob([out], { type: "application/zip" });
+  function sendProgress(event) {
+    chrome.runtime.sendMessage({
+      type: "CHATLIBERATE_PROGRESS",
+      message: event.message,
+      current: event.current,
+      total: event.total
+    });
   }
   async function runExport(mode, options) {
     const session = await fetchSessionFromPage();
-    const progress = (event) => {
-      chrome.runtime.sendMessage({
-        type: "CHATLIBERATE_PROGRESS",
-        message: event.message,
-        current: event.current,
-        total: event.total
-      });
-    };
+    const [memories, customInstructions] = await Promise.all([
+      fetchMemories(session).catch(() => []),
+      fetchCustomInstructions(session).catch(() => null)
+    ]);
     let result;
     if (mode === "current") {
       const id = getCurrentConversationId();
@@ -624,26 +1442,124 @@ ${body}`;
       result = await exportSingleConversation(session, id, {
         downloadFiles: options.downloadImages,
         downloadImages: options.downloadImages,
-        onProgress: progress
+        onProgress: sendProgress
       });
     } else {
+      const stored = await chrome.storage.local.get("exportProgress");
+      const prevProgress = stored.exportProgress ?? {};
+      const skipIds = new Set(prevProgress.downloadedIds ?? []);
+      const abortController = new AbortController();
       result = await exportAllConversations(session, {
         includeArchived: options.includeArchived,
         includeProjects: options.includeProjects,
         downloadFiles: options.downloadImages,
         downloadImages: options.downloadImages,
         throttleMs: 1200,
-        onProgress: progress
+        signal: abortController.signal,
+        onProgress: (event) => {
+          sendProgress(event);
+          if (event.phase === "downloading" && event.conversationId) {
+            const ids = [...prevProgress.downloadedIds ?? [], event.conversationId];
+            chrome.storage.local.set({ exportProgress: { downloadedIds: ids, lastExport: Date.now() } });
+          }
+          if (event.phase === "complete") {
+            chrome.storage.local.remove("exportProgress");
+          }
+        }
       });
     }
-    const zip = await buildZip(result, options);
+    const zip = await buildZip(result, { memories, customInstructions });
     const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
     downloadBlob(`chatliberate-export-${date}.zip`, zip);
-    return { ok: true, stats: result.stats };
+    return { ok: true, stats: { ...result.stats, memoriesCount: memories.length } };
+  }
+  async function copyContextForCurrent(options) {
+    const id = getCurrentConversationId();
+    if (!id) throw new Error("Open a conversation first");
+    const session = await fetchSessionFromPage();
+    const result = await exportSingleConversation(session, id, {
+      downloadFiles: false,
+      downloadImages: false
+    });
+    const fileExtMap = /* @__PURE__ */ new Map();
+    for (const [fileId, meta] of result.fileMeta) {
+      const mime = { "image/jpeg": ".jpeg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp" };
+      const ext = (meta.fileName ? meta.fileName.slice(meta.fileName.lastIndexOf(".")) : mime[meta.contentType?.split(";")[0].trim()]) ?? "";
+      if (ext) fileExtMap.set(fileId, ext);
+    }
+    const context = toContextBlock(result.conversations, {
+      maxChars: 12e4,
+      fileExtMap
+    });
+    const imgPattern = /\[image attached separately\]/g;
+    const imageCount = (context.match(imgPattern) || []).length;
+    return { ok: true, context, imageCount };
   }
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg.type !== "CHATLIBERATE_EXPORT") return;
-    runExport(msg.mode, msg.options).then((result) => sendResponse(result)).catch((err) => sendResponse({ ok: false, error: err.message }));
-    return true;
+    if (msg.type === "CHATLIBERATE_EXPORT") {
+      runExport(msg.mode, msg.options).then((result) => sendResponse(result)).catch((err2) => sendResponse({ ok: false, error: err2.message }));
+      return true;
+    }
+    if (msg.type === "CHATLIBERATE_COPY_CONTEXT") {
+      copyContextForCurrent(msg.options).then((result) => sendResponse(result)).catch((err2) => {
+        console.error("[ChatLiberate] copyContext error:", err2);
+        sendResponse({ ok: false, error: err2?.message ?? String(err2) });
+      });
+      return true;
+    }
+    if (msg.type === "CHATLIBERATE_PRINT") {
+      const id = getCurrentConversationId();
+      if (id) {
+        const expandSelectors = [
+          'button[data-testid="show-more-button"]',
+          "button.show-more",
+          'button[aria-label="Show more"]'
+          // ChatGPT renders truncated messages inside a max-h container with a gradient overlay;
+          // the expand button sits right after the truncated content div
+        ];
+        for (const sel of expandSelectors) {
+          document.querySelectorAll(sel).forEach((btn) => btn.click());
+        }
+        document.querySelectorAll("button").forEach((btn) => {
+          if (btn.textContent.trim().toLowerCase() === "show more") btn.click();
+        });
+        document.querySelectorAll('[class*="max-h-"]').forEach((el) => {
+          if (el.scrollHeight > el.clientHeight + 4) {
+            el.style.setProperty("max-height", "none", "important");
+            el.style.setProperty("overflow", "visible", "important");
+          }
+        });
+        const style = document.createElement("style");
+        style.id = "chatliberate-print-style";
+        style.textContent = `
+        @media print {
+          nav, aside, header,
+          [data-testid="conversation-header"],
+          [data-testid="composer"],
+          /* hide all buttons except inside message content */
+          body > * button,
+          .group\\/conversation-turn > div:last-child { display: none !important; }
+          body { background: white !important; color: black !important; }
+          main { max-width: 100% !important; padding: 0 !important; }
+          /* ensure nothing is clipped in print */
+          * { max-height: none !important; overflow: visible !important; }
+        }
+      `;
+        document.head.appendChild(style);
+        setTimeout(() => {
+          window.print();
+          setTimeout(() => {
+            style.remove();
+            document.querySelectorAll("[data-cl-expanded]").forEach((el) => {
+              el.style.removeProperty("max-height");
+              el.style.removeProperty("overflow");
+              el.removeAttribute("data-cl-expanded");
+            });
+          }, 3e3);
+        }, 300);
+      }
+      sendResponse({ ok: true });
+      return true;
+    }
   });
 })();

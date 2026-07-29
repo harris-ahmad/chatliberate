@@ -80,17 +80,46 @@ export function extractFileReferences(conversation: Conversation): FileReference
   return files;
 }
 
-export function extractMessageText(message: ChatGPTMessage): string {
+/** Extract text from a dict-type message part (audio_transcription, tether_quote, etc.) */
+function extractPartText(p: Record<string, unknown>): string {
+  // audio_transcription: { content_type: 'audio_transcription', text: '...', direction: 'in'|'out' }
+  if (typeof p.text === 'string' && p.text.trim()) return p.text.trim();
+  // tether_browsing_display, tether_quote: { content_type, ..., title, url, text }
+  if (typeof p.tether_id === 'string') return ''; // skip tether metadata
+  // summary inside thoughts
+  if (typeof p.summary === 'string' && p.summary.trim()) return p.summary.trim();
+  return '';
+}
+
+export function extractMessageText(
+  message: ChatGPTMessage,
+  fileExtMap: Map<string, string> = new Map(),
+): string {
   const content = message.content;
   if (!content) return '';
 
+  // Skip internal tool scaffolding (e.g. {"skipped_mainline":true})
+  const role = message.author?.role ?? '';
+  if (role === 'tool' || role === 'system') return '';
+
   if (content.content_type === 'text' && Array.isArray(content.parts)) {
     return content.parts
-      .filter((p): p is string => typeof p === 'string')
+      .map((p) => (typeof p === 'string' ? p : extractPartText(p as Record<string, unknown>)))
+      .filter(Boolean)
       .join('\n');
   }
 
   if (content.content_type === 'code' && typeof content.text === 'string') {
+    // Skip pure JSON blobs that are internal tool state, not user-visible content
+    const trimmed = content.text.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        JSON.parse(trimmed);
+        return ''; // silently drop internal JSON tool messages
+      } catch {
+        // not valid JSON — render as a code block
+      }
+    }
     const lang = (content.metadata?.language as string) ?? '';
     return `\`\`\`${lang}\n${content.text}\n\`\`\``;
   }
@@ -102,9 +131,13 @@ export function extractMessageText(message: ChatGPTMessage): string {
         if (part && typeof part === 'object') {
           const p = part as Record<string, unknown>;
           if (p.content_type === 'image_asset_pointer' && p.asset_pointer) {
-            const id = String(p.asset_pointer).replace(/^(sediment|file-service):\/\//, '');
-            return `![image](files/${id})`;
+            const rawId = String(p.asset_pointer).replace(/^(sediment|file-service):\/\//, '');
+            // Look up extension from download map; fallback to no extension
+            const ext = fileExtMap.get(rawId) ?? '';
+            return `![image](../files/${rawId}${ext})`;
           }
+          // audio_transcription, tether_quote, or any dict part with a text field
+          return extractPartText(p as Record<string, unknown>);
         }
         return '';
       })
@@ -123,10 +156,14 @@ export function extractMessageText(message: ChatGPTMessage): string {
   return '';
 }
 
-export function messageToMarkdown(message: ChatGPTMessage): string {
+export function messageToMarkdown(
+  message: ChatGPTMessage,
+  fileExtMap: Map<string, string> = new Map(),
+): string {
   const role = message.author?.role ?? 'unknown';
-  if (role === 'system') return '';
-  const text = extractMessageText(message);
+  // Skip system, tool, and internal scaffolding messages
+  if (role === 'system' || role === 'tool') return '';
+  const text = extractMessageText(message, fileExtMap);
   if (!text.trim()) return '';
 
   const label = role === 'user' ? '**You**' : '**Assistant**';
@@ -136,36 +173,37 @@ export function messageToMarkdown(message: ChatGPTMessage): string {
 
 export function conversationToMarkdown(
   conversation: Conversation,
-  options: { includeAllBranches?: boolean } = {},
+  options: { includeAllBranches?: boolean; fileExtMap?: Map<string, string> } = {},
 ): string {
   const title = conversation.title ?? 'Untitled';
   const id = conversation.conversation_id ?? conversation.id ?? '';
   const model = conversation.default_model_slug ?? 'unknown';
 
-  const frontmatter = [
+  const frontmatterLines = [
     '---',
     `title: "${escapeYaml(title)}"`,
     `id: ${id}`,
     `create_time: ${formatDate(conversation.create_time)}`,
     `update_time: ${formatDate(conversation.update_time)}`,
     `model: ${model}`,
-    conversation.gizmo_id ? `project_id: ${conversation.gizmo_id}` : null,
+    ...(conversation.gizmo_id ? [`project_id: ${conversation.gizmo_id}`] : []),
     '---',
-    '',
-  ]
-    .filter(Boolean)
-    .join('\n');
+  ];
+  const frontmatter = frontmatterLines.join('\n') + '\n\n';
+
+  const fmap = options.fileExtMap ?? new Map<string, string>();
+  const toMd = (m: ChatGPTMessage) => messageToMarkdown(m, fmap);
 
   if (options.includeAllBranches) {
     const branches = getAllBranches(conversation);
     if (branches.length <= 1) {
       const path = getActivePath(conversation);
-      const body = path.messages.map(messageToMarkdown).filter(Boolean).join('\n');
+      const body = path.messages.map(toMd).filter(Boolean).join('\n');
       return frontmatter + `# ${title}\n\n${body}`;
     }
 
     const sections = branches.map((branch, i) => {
-      const body = branch.messages.map(messageToMarkdown).filter(Boolean).join('\n');
+      const body = branch.messages.map(toMd).filter(Boolean).join('\n');
       return `## Branch ${i + 1}\n\n${body}`;
     });
 
@@ -173,6 +211,111 @@ export function conversationToMarkdown(
   }
 
   const path = getActivePath(conversation);
-  const body = path.messages.map(messageToMarkdown).filter(Boolean).join('\n');
+  const body = path.messages.map(toMd).filter(Boolean).join('\n');
   return frontmatter + `# ${title}\n\n${body}`;
+}
+
+/**
+ * Chunk a large markdown string into pieces that fit within a token budget.
+ * Approximates 1 token ≈ 4 chars. Default 80k tokens ≈ 320k chars per chunk.
+ */
+export function chunkMarkdown(
+  md: string,
+  maxCharsPerChunk = 320_000,
+): string[] {
+  if (md.length <= maxCharsPerChunk) return [md];
+
+  const chunks: string[] = [];
+  // Split on message boundaries (lines starting with **You** or **Assistant**)
+  const parts = md.split(/(?=\n\*\*(?:You|Assistant)\*\*)/);
+  let current = '';
+
+  for (const part of parts) {
+    if ((current + part).length > maxCharsPerChunk && current.length > 0) {
+      chunks.push(current);
+      current = part;
+    } else {
+      current += part;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+/**
+ * Produce a compact context block suitable for pasting at the top of a new
+ * Claude/Gemini/ChatGPT conversation to seed it with history.
+ * Strips frontmatter and collapses whitespace.
+ */
+export function toContextBlock(
+  conversations: Conversation[],
+  opts: {
+    maxChars?: number;
+    label?: string;
+    fileExtMap?: Map<string, string>;
+  } = {},
+): string {
+  const { maxChars = 60_000, label = 'Previous conversation history', fileExtMap = new Map() } = opts;
+
+  const imageFileIds: string[] = [];
+  const imgPattern = /!\[image\]\(\.\.\/files\/([^)]+)\)/g;
+
+  const lines: string[] = [`<${label}>`, ''];
+
+  let remaining = maxChars - label.length - 50;
+
+  for (const conv of conversations) {
+    const path = getActivePath(conv);
+    const title = conv.title ?? 'Untitled';
+    const header = `### ${title}\n`;
+    const body = path.messages
+      .map((m) => {
+        const role = m.author?.role === 'user' ? 'User' : 'Assistant';
+        let text = extractMessageText(m, fileExtMap).trim();
+        if (!text) return '';
+        // Collect image references and replace with placeholder
+        let match: RegExpExecArray | null;
+        imgPattern.lastIndex = 0;
+        while ((match = imgPattern.exec(text)) !== null) {
+          imageFileIds.push(match[1]);
+        }
+        text = text.replace(imgPattern, '[image attached separately]');
+        return `${role}: ${text}`;
+      })
+      .filter(Boolean)
+      .join('\n');
+
+    const entry = header + body + '\n\n';
+    if (entry.length > remaining) break;
+    lines.push(entry);
+    remaining -= entry.length;
+  }
+
+  if (imageFileIds.length > 0) {
+    const unique = [...new Set(imageFileIds)];
+    lines.push('---');
+    lines.push(`Note: This conversation contained ${unique.length} image(s). They are referenced as [image attached separately] above.`);
+    lines.push('To include them, upload these files from the exported ZIP\'s "files/" folder:');
+    for (const id of unique) {
+      lines.push(`  - files/${id}`);
+    }
+    lines.push('');
+  }
+
+  lines.push(`</${label}>`);
+  return lines.join('\n');
+}
+
+/** Obsidian-ready filename: YYYY-MM-DD title-slug id8.md */
+export function obsidianFilename(conv: Conversation): string {
+  const date = conv.create_time
+    ? new Date(Number(conv.create_time) * 1000).toISOString().slice(0, 10)
+    : 'unknown';
+  const slug = (conv.title ?? 'untitled')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 50);
+  const id8 = (conv.conversation_id ?? conv.id ?? '').slice(0, 8);
+  return `${date} ${slug} ${id8}.md`;
 }

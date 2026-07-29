@@ -8,8 +8,13 @@
 </head>
 <body>
   <header>
-    <h1>ChatLiberate</h1>
-    <p class="tagline">Your chats. Your data. Every account.</p>
+    <div class="brand">
+      <img src="icons/icon48.png" alt="" width="32" height="32" class="logo" />
+      <div>
+        <h1>ChatLiberate</h1>
+        <p class="tagline">Your chats. Your data. Every account.</p>
+      </div>
+    </div>
   </header>
 
   <div id="status" class="status warn">
@@ -24,7 +29,14 @@
   </section>
 
   <button id="exportAll" class="primary" disabled>Export All Conversations</button>
-  <button id="exportCurrent" class="secondary" disabled>Export Current Chat</button>
+
+  <div class="row">
+    <button id="exportCurrent" class="secondary" disabled>Export Current Chat</button>
+    <button id="copyContext" class="secondary icon" disabled title="Copy current chat as context for Claude/Gemini">⎘ Copy</button>
+  </div>
+
+  <button id="exportPdf" class="ghost" disabled>Print current chat as PDF</button>
+  <button id="clearResume" class="ghost hidden">Clear saved progress</button>
 
   <div id="progress" class="progress hidden">
     <div class="bar"><div id="barFill" class="fill"></div></div>

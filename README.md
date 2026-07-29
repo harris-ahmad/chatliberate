@@ -1,10 +1,21 @@
-# ChatLiberate
+<p align="center">
+  <img src="assets/logo-512.png" alt="ChatLiberate logo" width="120" height="120" />
+</p>
 
-**The open-source ChatGPT exporter that actually works on every account type.**
+<h1 align="center">ChatLiberate</h1>
+
+<p align="center">
+  <strong>Your chats. Your data. Every account.</strong><br />
+  The open-source ChatGPT exporter that actually works on Business &amp; Teams.
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT" /></a>
+  <img src="https://img.shields.io/badge/Chrome-Extension-10a37f?logo=googlechrome&logoColor=white" alt="Chrome Extension" />
+  <img src="https://img.shields.io/badge/CLI-Node.js-339933?logo=nodedotjs&logoColor=white" alt="CLI" />
+</p>
 
 OpenAI blocks data export for [ChatGPT Business and Teams](https://www.reddit.com/r/OpenAI/comments/1pe3p9a/every_way_to_export_chatgpt_conversations_and/) users. Third-party tools produce incompatible formats. Images get lost. Regenerated replies vanish. ChatLiberate fixes all of it.
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## What it solves
 

@@ -1,10 +1,18 @@
 import {
   exportAllConversations,
   exportSingleConversation,
+  fetchMemories,
+  fetchCustomInstructions,
   fetchSessionFromPage,
+  memoriesToMarkdown,
+  customInstructionsToMarkdown,
   toMarkdownBundle,
   toOpenAIExportFormat,
+  toContextBlock,
+  obsidianFilename,
+  chunkMarkdown,
 } from '@chatliberate/core';
+import { zipSync, strToU8 } from 'fflate';
 
 function getCurrentConversationId() {
   const match = window.location.pathname.match(/\/c\/([a-f0-9-]+)/i);
@@ -20,25 +28,67 @@ function downloadBlob(filename, blob) {
   URL.revokeObjectURL(url);
 }
 
-async function buildZip(result, options) {
+async function buildZip(result, extras = {}) {
   const files = {};
 
+  // 1. Official OAI-format JSON (Memory Forge / context-pack compatible)
   const oai = toOpenAIExportFormat(result.conversations);
   files['conversations.json'] = JSON.stringify(oai, null, 2);
 
-  const mdBundle = toMarkdownBundle(result.conversations);
+  // 2. Markdown — Obsidian-ready filenames, with correct image extensions
+  const mdBundle = toMarkdownBundle(result.conversations, result.fileMeta);
   for (const [id, md] of mdBundle) {
     const conv = result.conversations.find((c) => (c.conversation_id ?? c.id) === id);
-    const name = (conv?.title ?? id).replace(/[<>:"/\\|?*]/g, '_').slice(0, 60);
-    files[`markdown/${name}_${id.slice(0, 8)}.md`] = md;
+    const fname = conv ? obsidianFilename(conv) : `${id.slice(0, 8)}.md`;
+    files[`markdown/${fname}`] = md;
+
+    // Large conversation: also write chunked versions for context-window reuse
+    const chunks = chunkMarkdown(md, 320_000);
+    if (chunks.length > 1) {
+      chunks.forEach((chunk, i) => {
+        files[`markdown/chunks/${fname.replace('.md', '')}-part${i + 1}.md`] = chunk;
+      });
+    }
   }
 
+  // 3. Downloaded images / attachments
   for (const [fileId, data] of result.files) {
     const meta = result.fileMeta.get(fileId);
     const ext = meta?.fileName ? meta.fileName.split('.').pop() : 'bin';
     files[`files/${fileId}.${ext}`] = data;
   }
 
+  // 4. Memories
+  if (extras.memories?.length) {
+    files['memory.json'] = JSON.stringify(extras.memories, null, 2);
+    files['memory.md'] = memoriesToMarkdown(extras.memories);
+  }
+
+  // 5. Custom instructions
+  if (extras.customInstructions) {
+    files['custom-instructions.json'] = JSON.stringify(extras.customInstructions, null, 2);
+    files['custom-instructions.md'] = customInstructionsToMarkdown(extras.customInstructions);
+  }
+
+  // Build fileExtMap for context block (same as toMarkdownBundle uses internally)
+  const fileExtMap = new Map();
+  for (const [fileId, meta] of result.fileMeta) {
+    let ext = '';
+    if (meta.fileName) {
+      const dot = meta.fileName.lastIndexOf('.');
+      if (dot !== -1) ext = meta.fileName.slice(dot);
+    } else if (meta.contentType) {
+      const mime = { 'image/jpeg': '.jpeg', 'image/jpg': '.jpeg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp' };
+      ext = mime[meta.contentType.split(';')[0].trim()] ?? '';
+    }
+    if (ext) fileExtMap.set(fileId, ext);
+  }
+
+  // 6. Import-ready context block for Claude/Gemini
+  const contextBlock = toContextBlock(result.conversations, { maxChars: 60_000, fileExtMap });
+  files['import-context-for-claude-gemini.md'] = contextBlock;
+
+  // 7. Stats
   files['export-stats.json'] = JSON.stringify(
     {
       exportedAt: new Date().toISOString(),
@@ -46,135 +96,195 @@ async function buildZip(result, options) {
       tool: 'chatliberate',
       version: '0.1.0',
       accountType: document.cookie.includes('_account=') ? 'teams/business' : 'personal',
+      memoriesCount: extras.memories?.length ?? 0,
+      hasCustomInstructions: Boolean(extras.customInstructions?.about_user || extras.customInstructions?.about_model),
     },
     null,
     2,
   );
 
-  return createZip(files);
+  const zipInput = {};
+  for (const [name, content] of Object.entries(files)) {
+    zipInput[name] = typeof content === 'string' ? strToU8(content) : content;
+  }
+  const zipped = zipSync(zipInput, { level: 0 });
+  return new Blob([zipped], { type: 'application/zip' });
 }
 
-function createZip(fileMap) {
-  const encoder = new TextEncoder();
-  const entries = [];
-  let offset = 0;
-  const chunks = [];
-
-  function crc32(data) {
-    let crc = 0xffffffff;
-    for (let i = 0; i < data.length; i++) {
-      crc ^= data[i];
-      for (let j = 0; j < 8; j++) {
-        crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
-      }
-    }
-    return (crc ^ 0xffffffff) >>> 0;
-  }
-
-  for (const [name, content] of Object.entries(fileMap)) {
-    const nameBytes = encoder.encode(name);
-    const data = typeof content === 'string' ? encoder.encode(content) : content;
-    const crc = crc32(data);
-
-    const local = new Uint8Array(30 + nameBytes.length);
-    const view = new DataView(local.buffer);
-    view.setUint32(0, 0x04034b50, true);
-    view.setUint16(4, 20, true);
-    view.setUint16(26, nameBytes.length, true);
-    view.setUint32(18, crc, true);
-    view.setUint32(22, data.length, true);
-    view.setUint32(26, data.length, true);
-    local.set(nameBytes, 30);
-
-    const localOffset = offset;
-    chunks.push(local, data);
-    offset += local.length + data.length;
-
-    entries.push({ name, nameBytes, crc, size: data.length, offset: localOffset });
-  }
-
-  const centralStart = offset;
-  for (const entry of entries) {
-    const central = new Uint8Array(46 + entry.nameBytes.length);
-    const view = new DataView(central.buffer);
-    view.setUint32(0, 0x02014b50, true);
-    view.setUint16(4, 20, true);
-    view.setUint16(6, 20, true);
-    view.setUint16(28, entry.nameBytes.length, true);
-    view.setUint32(16, entry.crc, true);
-    view.setUint32(20, entry.size, true);
-    view.setUint32(24, entry.size, true);
-    view.setUint32(42, entry.offset, true);
-    central.set(entry.nameBytes, 46);
-    chunks.push(central);
-    offset += central.length;
-  }
-
-  const end = new Uint8Array(22);
-  const endView = new DataView(end.buffer);
-  endView.setUint32(0, 0x06054b50, true);
-  endView.setUint16(8, entries.length, true);
-  endView.setUint16(10, entries.length, true);
-  endView.setUint32(12, offset - centralStart, true);
-  endView.setUint32(16, centralStart, true);
-  chunks.push(end);
-
-  const total = chunks.reduce((sum, c) => sum + c.length, 0);
-  const out = new Uint8Array(total);
-  let pos = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, pos);
-    pos += chunk.length;
-  }
-
-  return new Blob([out], { type: 'application/zip' });
+function sendProgress(event) {
+  chrome.runtime.sendMessage({
+    type: 'CHATLIBERATE_PROGRESS',
+    message: event.message,
+    current: event.current,
+    total: event.total,
+  });
 }
 
 async function runExport(mode, options) {
   const session = await fetchSessionFromPage();
 
-  const progress = (event) => {
-    chrome.runtime.sendMessage({
-      type: 'CHATLIBERATE_PROGRESS',
-      message: event.message,
-      current: event.current,
-      total: event.total,
-    });
-  };
+  // Fetch memories + custom instructions in parallel (non-fatal if they fail)
+  const [memories, customInstructions] = await Promise.all([
+    fetchMemories(session).catch(() => []),
+    fetchCustomInstructions(session).catch(() => null),
+  ]);
 
   let result;
+
   if (mode === 'current') {
     const id = getCurrentConversationId();
     if (!id) throw new Error('Open a conversation first (URL should contain /c/)');
     result = await exportSingleConversation(session, id, {
       downloadFiles: options.downloadImages,
       downloadImages: options.downloadImages,
-      onProgress: progress,
+      onProgress: sendProgress,
     });
   } else {
+    // Incremental resume: load previously downloaded IDs from chrome.storage
+    const stored = await chrome.storage.local.get('exportProgress');
+    const prevProgress = stored.exportProgress ?? {};
+    const skipIds = new Set(prevProgress.downloadedIds ?? []);
+
+    const abortController = new AbortController();
+
     result = await exportAllConversations(session, {
       includeArchived: options.includeArchived,
       includeProjects: options.includeProjects,
       downloadFiles: options.downloadImages,
       downloadImages: options.downloadImages,
       throttleMs: 1200,
-      onProgress: progress,
+      signal: abortController.signal,
+      onProgress: (event) => {
+        sendProgress(event);
+        // Persist progress so a future session can resume
+        if (event.phase === 'downloading' && event.conversationId) {
+          const ids = [...(prevProgress.downloadedIds ?? []), event.conversationId];
+          chrome.storage.local.set({ exportProgress: { downloadedIds: ids, lastExport: Date.now() } });
+        }
+        if (event.phase === 'complete') {
+          chrome.storage.local.remove('exportProgress');
+        }
+      },
     });
   }
 
-  const zip = await buildZip(result, options);
+  const zip = await buildZip(result, { memories, customInstructions });
   const date = new Date().toISOString().slice(0, 10);
   downloadBlob(`chatliberate-export-${date}.zip`, zip);
 
-  return { ok: true, stats: result.stats };
+  return { ok: true, stats: { ...result.stats, memoriesCount: memories.length } };
+}
+
+async function copyContextForCurrent(options) {
+  const id = getCurrentConversationId();
+  if (!id) throw new Error('Open a conversation first');
+
+  const session = await fetchSessionFromPage();
+  const result = await exportSingleConversation(session, id, {
+    downloadFiles: false,
+    downloadImages: false,
+  });
+
+  const fileExtMap = new Map();
+  for (const [fileId, meta] of result.fileMeta) {
+    const mime = { 'image/jpeg': '.jpeg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp' };
+    const ext = (meta.fileName ? meta.fileName.slice(meta.fileName.lastIndexOf('.')) : mime[meta.contentType?.split(';')[0].trim()]) ?? '';
+    if (ext) fileExtMap.set(fileId, ext);
+  }
+
+  const context = toContextBlock(result.conversations, {
+    maxChars: 120_000,
+    fileExtMap,
+  });
+
+  // Count unique images referenced in the conversation
+  const imgPattern = /\[image attached separately\]/g;
+  const imageCount = (context.match(imgPattern) || []).length;
+
+  return { ok: true, context, imageCount };
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type !== 'CHATLIBERATE_EXPORT') return;
+  if (msg.type === 'CHATLIBERATE_EXPORT') {
+    runExport(msg.mode, msg.options)
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
 
-  runExport(msg.mode, msg.options)
-    .then((result) => sendResponse(result))
-    .catch((err) => sendResponse({ ok: false, error: err.message }));
+  if (msg.type === 'CHATLIBERATE_COPY_CONTEXT') {
+    copyContextForCurrent(msg.options)
+      .then((result) => sendResponse(result))
+      .catch((err) => {
+        console.error('[ChatLiberate] copyContext error:', err);
+        sendResponse({ ok: false, error: err?.message ?? String(err) });
+      });
+    return true;
+  }
 
-  return true;
+  if (msg.type === 'CHATLIBERATE_PRINT') {
+    const id = getCurrentConversationId();
+    if (id) {
+      // 1. Click every "Show more" button to expand truncated user messages
+      const expandSelectors = [
+        'button[data-testid="show-more-button"]',
+        'button.show-more',
+        'button[aria-label="Show more"]',
+        // ChatGPT renders truncated messages inside a max-h container with a gradient overlay;
+        // the expand button sits right after the truncated content div
+      ];
+      for (const sel of expandSelectors) {
+        document.querySelectorAll(sel).forEach((btn) => btn.click());
+      }
+      // Generic fallback: click any button whose visible text is exactly "Show more"
+      document.querySelectorAll('button').forEach((btn) => {
+        if (btn.textContent.trim().toLowerCase() === 'show more') btn.click();
+      });
+
+      // 2. Also force-expand any element using max-height truncation (ChatGPT wraps long
+      //    user messages in a div with a hard max-h via Tailwind, e.g. max-h-[something])
+      document.querySelectorAll('[class*="max-h-"]').forEach((el) => {
+        // Only touch elements that look like truncated message bodies
+        if (el.scrollHeight > el.clientHeight + 4) {
+          el.style.setProperty('max-height', 'none', 'important');
+          el.style.setProperty('overflow', 'visible', 'important');
+        }
+      });
+
+      // 3. Inject print stylesheet
+      const style = document.createElement('style');
+      style.id = 'chatliberate-print-style';
+      style.textContent = `
+        @media print {
+          nav, aside, header,
+          [data-testid="conversation-header"],
+          [data-testid="composer"],
+          /* hide all buttons except inside message content */
+          body > * button,
+          .group\\/conversation-turn > div:last-child { display: none !important; }
+          body { background: white !important; color: black !important; }
+          main { max-width: 100% !important; padding: 0 !important; }
+          /* ensure nothing is clipped in print */
+          * { max-height: none !important; overflow: visible !important; }
+        }
+      `;
+      document.head.appendChild(style);
+
+      // Small delay to let the DOM settle after clicks before print dialog opens
+      setTimeout(() => {
+        window.print();
+        setTimeout(() => {
+          style.remove();
+          // Restore any inline styles we set
+          document.querySelectorAll('[data-cl-expanded]').forEach((el) => {
+            el.style.removeProperty('max-height');
+            el.style.removeProperty('overflow');
+            el.removeAttribute('data-cl-expanded');
+          });
+        }, 3000);
+      }, 300);
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
 });
