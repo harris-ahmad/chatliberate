@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT" /></a>
+  <a href="PRIVACY.md"><img src="https://img.shields.io/badge/Privacy-Local--first-0d8c6d" alt="Privacy: Local-first" /></a>
   <img src="https://img.shields.io/badge/Chrome-Extension-10a37f?logo=googlechrome&logoColor=white" alt="Chrome Extension" />
   <img src="https://img.shields.io/badge/CLI-Node.js-339933?logo=nodedotjs&logoColor=white" alt="CLI" />
 </p>

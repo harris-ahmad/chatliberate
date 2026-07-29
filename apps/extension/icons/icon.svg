@@ -1,37 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="ChatLiberate">
-  <!-- App tile -->
-  <rect width="128" height="128" rx="28" fill="#0d8c6d"/>
-
-  <!-- Chat bubble with export arrow cut out via evenodd -->
-  <path
-    fill="#ffffff"
-    fill-rule="evenodd"
-    d="
-      M64 22
-      c24.3 0 44 19.7 44 44
-      c0 24.3 -19.7 44 -44 44
-      c-7.4 0 -14.4 -1.8 -20.5 -5.1
-      L28 112
-      l4.8 -14.9
-      C27.3 90.2 24 80.5 24 66
-      c0 -24.3 19.7 -44 40 -44
-      z
-
-      M42 64
-      c0 -3.3 2.7 -6 6 -6
-      h22.5
-      l-5.3 -5.3
-      c-2.3 -2.3 -2.3 -6.1 0 -8.5
-      c2.3 -2.3 6.1 -2.3 8.5 0
-      l15.5 15.5
-      c2.3 2.3 2.3 6.1 0 8.5
-      L73.7 83.7
-      c-2.3 2.3 -6.1 2.3 -8.5 0
-      c-2.3 -2.3 -2.3 -6.1 0 -8.5
-      L70.5 70
-      H48
-      c-3.3 0 -6 -2.7 -6 -6
-      z
-    "
-  />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="24" fill="#10a37f"/>
+  <path d="M32 44h64v8H32zm0 20h48v8H32zm0 20h56v8H32z" fill="white"/>
+  <path d="M88 76l12 12-12 12v-8H72v-8h16z" fill="white" opacity="0.9"/>
 </svg>
