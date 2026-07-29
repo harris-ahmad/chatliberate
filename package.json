@@ -1,0 +1,26 @@
+{
+  "name": "chatliberate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open-source ChatGPT exporter — works on Business/Teams, preserves branches & images",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @chatliberate/core && npm run build -w @chatliberate/cli",
+    "build:extension": "npm run build && node scripts/build-extension.mjs",
+    "dev": "npm run build -w @chatliberate/core -- --watch",
+    "test": "npm run build -w @chatliberate/core && npm run test -w @chatliberate/core"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3"
+  }
+}

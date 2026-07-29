@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ChatLiberate</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <h1>ChatLiberate</h1>
+    <p class="tagline">Your chats. Your data. Every account.</p>
+  </header>
+
+  <div id="status" class="status warn">
+    Open <a href="https://chatgpt.com" target="_blank">chatgpt.com</a> first
+  </div>
+
+  <section class="options">
+    <label><input type="checkbox" id="includeArchived" checked /> Archived chats</label>
+    <label><input type="checkbox" id="includeProjects" checked /> Project chats</label>
+    <label><input type="checkbox" id="downloadImages" checked /> Download images</label>
+    <label><input type="checkbox" id="includeBranches" checked /> All regenerated branches</label>
+  </section>
+
+  <button id="exportAll" class="primary" disabled>Export All Conversations</button>
+  <button id="exportCurrent" class="secondary" disabled>Export Current Chat</button>
+
+  <div id="progress" class="progress hidden">
+    <div class="bar"><div id="barFill" class="fill"></div></div>
+    <p id="progressText">Starting…</p>
+  </div>
+
+  <footer>
+    <a href="https://github.com/chatliberate/chatliberate" target="_blank">Open source</a>
+    · MIT License
+  </footer>
+  <script src="popup.js"></script>
+</body>
+</html>
