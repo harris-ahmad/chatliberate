@@ -6,10 +6,9 @@ import {
   fetchSessionFromPage,
   memoriesToMarkdown,
   customInstructionsToMarkdown,
-  toMarkdownBundle,
+  toMarkdownExportLayout,
   toOpenAIExportFormat,
   toContextBlock,
-  obsidianFilename,
   chunkMarkdown,
 } from '@chatliberate/core';
 import { zipSync, strToU8 } from 'fflate';
@@ -35,18 +34,21 @@ async function buildZip(result, extras = {}) {
   const oai = toOpenAIExportFormat(result.conversations);
   files['conversations.json'] = JSON.stringify(oai, null, 2);
 
-  // 2. Markdown — Obsidian-ready filenames, with correct image extensions
-  const mdBundle = toMarkdownBundle(result.conversations, result.fileMeta);
-  for (const [id, md] of mdBundle) {
-    const conv = result.conversations.find((c) => (c.conversation_id ?? c.id) === id);
-    const fname = conv ? obsidianFilename(conv) : `${id.slice(0, 8)}.md`;
-    files[`markdown/${fname}`] = md;
+  // 2. Markdown tree — projects/archived folders + Obsidian filenames
+  const layout = toMarkdownExportLayout(result.conversations, {
+    fileMeta: result.fileMeta,
+    index: result.index,
+  });
+  files['INDEX.md'] = layout.indexMarkdown;
 
-    // Large conversation: also write chunked versions for context-window reuse
+  for (const [path, md] of layout.files) {
+    files[path] = md;
+
+    // Large conversation: also write chunked versions beside the original file
     const chunks = chunkMarkdown(md, 320_000);
     if (chunks.length > 1) {
       chunks.forEach((chunk, i) => {
-        files[`markdown/chunks/${fname.replace('.md', '')}-part${i + 1}.md`] = chunk;
+        files[path.replace(/\.md$/, `-part${i + 1}.md`)] = chunk;
       });
     }
   }
@@ -70,7 +72,7 @@ async function buildZip(result, extras = {}) {
     files['custom-instructions.md'] = customInstructionsToMarkdown(extras.customInstructions);
   }
 
-  // Build fileExtMap for context block (same as toMarkdownBundle uses internally)
+  // Build fileExtMap for context block
   const fileExtMap = new Map();
   for (const [fileId, meta] of result.fileMeta) {
     let ext = '';
@@ -89,15 +91,20 @@ async function buildZip(result, extras = {}) {
   files['import-context-for-claude-gemini.md'] = contextBlock;
 
   // 7. Stats
+  const projectNames = new Set(
+    layout.entries.filter((e) => e.projectName).map((e) => e.projectName),
+  );
   files['export-stats.json'] = JSON.stringify(
     {
       exportedAt: new Date().toISOString(),
       ...result.stats,
       tool: 'chatliberate',
-      version: '0.1.0',
+      version: '0.1.1',
       accountType: document.cookie.includes('_account=') ? 'teams/business' : 'personal',
       memoriesCount: extras.memories?.length ?? 0,
       hasCustomInstructions: Boolean(extras.customInstructions?.about_user || extras.customInstructions?.about_model),
+      projectNames: [...projectNames],
+      indexEntries: layout.entries.length,
     },
     null,
     2,

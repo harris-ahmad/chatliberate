@@ -8,7 +8,7 @@ import {
   exportAllConversations,
   fetchWithRetry,
   getApiBase,
-  toMarkdownBundle,
+  toMarkdownExportLayout,
   toOpenAIExportFormat,
 } from '@chatliberate/core';
 
@@ -106,15 +106,17 @@ function writeExport(result, opts) {
   }
 
   if (opts.format === 'markdown' || opts.format === 'both' || opts.format === 'zip') {
-    const mdDir = path.join(baseDir, 'markdown');
-    ensureDir(mdDir);
-    const bundle = toMarkdownBundle(result.conversations);
-    for (const [id, md] of bundle) {
-      const conv = result.conversations.find((c) => (c.conversation_id ?? c.id) === id);
-      const name = (conv?.title ?? id).replace(/[<>:"/\\|?*]/g, '_').slice(0, 80);
-      fs.writeFileSync(path.join(mdDir, `${name}_${id.slice(0, 8)}.md`), md);
+    const layout = toMarkdownExportLayout(result.conversations, {
+      fileMeta: result.fileMeta,
+      index: result.index,
+    });
+    fs.writeFileSync(path.join(baseDir, 'INDEX.md'), layout.indexMarkdown);
+    for (const [relPath, md] of layout.files) {
+      const full = path.join(baseDir, relPath);
+      ensureDir(path.dirname(full));
+      fs.writeFileSync(full, md);
     }
-    console.log(`✓ Wrote ${bundle.size} markdown files to ${mdDir}`);
+    console.log(`✓ Wrote INDEX.md + ${layout.files.size} markdown files under ${path.join(baseDir, 'markdown')}`);
   }
 
   if (result.files.size > 0) {

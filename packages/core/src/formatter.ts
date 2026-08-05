@@ -94,6 +94,7 @@ function extractPartText(p: Record<string, unknown>): string {
 export function extractMessageText(
   message: ChatGPTMessage,
   fileExtMap: Map<string, string> = new Map(),
+  filesRelPath = '../files',
 ): string {
   const content = message.content;
   if (!content) return '';
@@ -134,7 +135,7 @@ export function extractMessageText(
             const rawId = String(p.asset_pointer).replace(/^(sediment|file-service):\/\//, '');
             // Look up extension from download map; fallback to no extension
             const ext = fileExtMap.get(rawId) ?? '';
-            return `![image](../files/${rawId}${ext})`;
+            return `![image](${filesRelPath}/${rawId}${ext})`;
           }
           // audio_transcription, tether_quote, or any dict part with a text field
           return extractPartText(p as Record<string, unknown>);
@@ -159,11 +160,12 @@ export function extractMessageText(
 export function messageToMarkdown(
   message: ChatGPTMessage,
   fileExtMap: Map<string, string> = new Map(),
+  filesRelPath = '../files',
 ): string {
   const role = message.author?.role ?? 'unknown';
   // Skip system, tool, and internal scaffolding messages
   if (role === 'system' || role === 'tool') return '';
-  const text = extractMessageText(message, fileExtMap);
+  const text = extractMessageText(message, fileExtMap, filesRelPath);
   if (!text.trim()) return '';
 
   const label = role === 'user' ? '**You**' : '**Assistant**';
@@ -173,11 +175,19 @@ export function messageToMarkdown(
 
 export function conversationToMarkdown(
   conversation: Conversation,
-  options: { includeAllBranches?: boolean; fileExtMap?: Map<string, string> } = {},
+  options: {
+    includeAllBranches?: boolean;
+    fileExtMap?: Map<string, string>;
+    filesRelPath?: string;
+    projectName?: string;
+  } = {},
 ): string {
   const title = conversation.title ?? 'Untitled';
   const id = conversation.conversation_id ?? conversation.id ?? '';
   const model = conversation.default_model_slug ?? 'unknown';
+  const projectName =
+    options.projectName ??
+    (typeof conversation._projectName === 'string' ? conversation._projectName : undefined);
 
   const frontmatterLines = [
     '---',
@@ -187,12 +197,14 @@ export function conversationToMarkdown(
     `update_time: ${formatDate(conversation.update_time)}`,
     `model: ${model}`,
     ...(conversation.gizmo_id ? [`project_id: ${conversation.gizmo_id}`] : []),
+    ...(projectName ? [`project: "${escapeYaml(projectName)}"`] : []),
     '---',
   ];
   const frontmatter = frontmatterLines.join('\n') + '\n\n';
 
   const fmap = options.fileExtMap ?? new Map<string, string>();
-  const toMd = (m: ChatGPTMessage) => messageToMarkdown(m, fmap);
+  const filesRel = options.filesRelPath ?? '../files';
+  const toMd = (m: ChatGPTMessage) => messageToMarkdown(m, fmap, filesRel);
 
   if (options.includeAllBranches) {
     const branches = getAllBranches(conversation);
@@ -319,3 +331,141 @@ export function obsidianFilename(conv: Conversation): string {
   const id8 = (conv.conversation_id ?? conv.id ?? '').slice(0, 8);
   return `${date} ${slug} ${id8}.md`;
 }
+
+/** Folder-safe slug for project names */
+export function slugifySegment(name: string): string {
+  const slug = (name || 'untitled')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return slug || 'untitled';
+}
+
+export interface MarkdownPathInfo {
+  /** Path under the export root, e.g. markdown/projects/foo/2026-01-01 title id.md */
+  path: string;
+  /** Relative prefix from that markdown file to the files/ folder */
+  filesRelPath: string;
+  projectName?: string;
+  archived?: boolean;
+}
+
+/**
+ * Decide where a conversation's markdown should live.
+ * Project chats → markdown/projects/<slug>/…
+ * Archived (non-project) → markdown/archived/…
+ * Everything else → markdown/…
+ */
+export function markdownExportPath(
+  conv: Conversation,
+  meta: { projectName?: string; archived?: boolean } = {},
+): MarkdownPathInfo {
+  const fname = obsidianFilename(conv);
+  const projectName =
+    meta.projectName ??
+    (typeof conv._projectName === 'string' ? conv._projectName : undefined);
+
+  if (projectName) {
+    return {
+      path: `markdown/projects/${slugifySegment(projectName)}/${fname}`,
+      filesRelPath: '../../files',
+      projectName,
+      archived: meta.archived,
+    };
+  }
+
+  if (meta.archived || conv.is_archived === true) {
+    return {
+      path: `markdown/archived/${fname}`,
+      filesRelPath: '../../files',
+      archived: true,
+    };
+  }
+
+  return {
+    path: `markdown/${fname}`,
+    filesRelPath: '../files',
+    archived: false,
+  };
+}
+
+export interface ExportIndexEntry {
+  title: string;
+  id: string;
+  path: string;
+  createTime?: number | string | null;
+  updateTime?: number | string | null;
+  projectName?: string;
+  archived?: boolean;
+}
+
+/** Searchable INDEX.md listing every exported chat with links into the markdown tree */
+export function buildExportIndexMarkdown(
+  entries: ExportIndexEntry[],
+  opts: { exportedAt?: string; conversationCount?: number; projectCount?: number } = {},
+): string {
+  const sorted = [...entries].sort((a, b) => {
+    const at = Number(a.updateTime ?? a.createTime ?? 0);
+    const bt = Number(b.updateTime ?? b.createTime ?? 0);
+    return bt - at;
+  });
+
+  const projects = new Map<string, ExportIndexEntry[]>();
+  const archived: ExportIndexEntry[] = [];
+  const inbox: ExportIndexEntry[] = [];
+
+  for (const e of sorted) {
+    if (e.projectName) {
+      const list = projects.get(e.projectName) ?? [];
+      list.push(e);
+      projects.set(e.projectName, list);
+    } else if (e.archived) {
+      archived.push(e);
+    } else {
+      inbox.push(e);
+    }
+  }
+
+  const lines: string[] = [
+    '# ChatLiberate Export Index',
+    '',
+    `Exported: ${opts.exportedAt ?? new Date().toISOString()}`,
+    `Conversations: ${opts.conversationCount ?? entries.length}`,
+    `Projects: ${opts.projectCount ?? projects.size}`,
+    '',
+    'Jump to a chat below. Links open the Markdown file in this ZIP.',
+    '',
+  ];
+
+  const linkLine = (e: ExportIndexEntry) => {
+    const date = e.updateTime || e.createTime
+      ? formatDate(e.updateTime ?? e.createTime).slice(0, 10)
+      : 'unknown';
+    return `- [${e.title || 'Untitled'}](${e.path}) — ${date}`;
+  };
+
+  if (projects.size > 0) {
+    lines.push('## Projects', '');
+    for (const name of [...projects.keys()].sort((a, b) => a.localeCompare(b))) {
+      lines.push(`### ${name}`, '');
+      for (const e of projects.get(name)!) lines.push(linkLine(e));
+      lines.push('');
+    }
+  }
+
+  if (inbox.length > 0) {
+    lines.push('## Chats', '');
+    for (const e of inbox) lines.push(linkLine(e));
+    lines.push('');
+  }
+
+  if (archived.length > 0) {
+    lines.push('## Archived', '');
+    for (const e of archived) lines.push(linkLine(e));
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
