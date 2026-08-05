@@ -1531,7 +1531,7 @@ ${ci.about_model}
         exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
         ...result.stats,
         tool: "chatliberate",
-        version: "0.1.1",
+        version: "0.1.2",
         accountType: document.cookie.includes("_account=") ? "teams/business" : "personal",
         memoriesCount: extras.memories?.length ?? 0,
         hasCustomInstructions: Boolean(extras.customInstructions?.about_user || extras.customInstructions?.about_model),

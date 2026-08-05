@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatLiberate — Export ChatGPT",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "One-click export for ALL ChatGPT conversations. Works on Business/Teams. Preserves branches & images.",
   "permissions": ["activeTab", "storage"],
   "host_permissions": [

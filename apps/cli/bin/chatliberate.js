@@ -138,7 +138,7 @@ function writeExport(result, opts) {
         exportedAt: new Date().toISOString(),
         ...result.stats,
         tool: 'chatliberate',
-        version: '0.1.0',
+        version: '0.1.2',
       },
       null,
       2,
