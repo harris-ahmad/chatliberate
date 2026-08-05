@@ -33,7 +33,7 @@ OpenAI blocks data export for [ChatGPT Business and Teams](https://www.reddit.co
 
 1. Clone and build:
    ```bash
-   git clone https://github.com/chatliberate/chatliberate.git
+   git clone https://github.com/harris-ahmad/chatliberate.git
    cd chatliberate
    npm install
    npm run build
