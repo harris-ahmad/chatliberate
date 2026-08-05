@@ -48,9 +48,12 @@ OpenAI blocks data export for [ChatGPT Business and Teams](https://www.reddit.co
 3. Open [chatgpt.com](https://chatgpt.com), log in, click the ChatLiberate icon → **Export All Conversations**
 
 You get a ZIP with:
+- `INDEX.md` — searchable list of every chat (grouped by project)
 - `conversations.json` — OpenAI-compatible, works with Memory Forge, context-pack, Obsidian plugins
 - `markdown/` — human-readable exports with all branches
-- `files/` — images and attachments
+  - `markdown/projects/<project>/` — chats that belong to a GPT Project
+  - `markdown/archived/` — archived chats
+- `files/` — images and attachments (linked from markdown)
 - `export-stats.json` — metadata
 
 ## CLI (for power users & automation)

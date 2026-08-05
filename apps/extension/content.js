@@ -197,7 +197,7 @@
     if (typeof p.summary === "string" && p.summary.trim()) return p.summary.trim();
     return "";
   }
-  function extractMessageText(message, fileExtMap = /* @__PURE__ */ new Map()) {
+  function extractMessageText(message, fileExtMap = /* @__PURE__ */ new Map(), filesRelPath = "../files") {
     const content = message.content;
     if (!content) return "";
     const role = message.author?.role ?? "";
@@ -227,7 +227,7 @@ ${content.text}
           if (p.content_type === "image_asset_pointer" && p.asset_pointer) {
             const rawId = String(p.asset_pointer).replace(/^(sediment|file-service):\/\//, "");
             const ext = fileExtMap.get(rawId) ?? "";
-            return `![image](../files/${rawId}${ext})`;
+            return `![image](${filesRelPath}/${rawId}${ext})`;
           }
           return extractPartText(p);
         }
@@ -244,10 +244,10 @@ ${thoughts}
     }
     return "";
   }
-  function messageToMarkdown(message, fileExtMap = /* @__PURE__ */ new Map()) {
+  function messageToMarkdown(message, fileExtMap = /* @__PURE__ */ new Map(), filesRelPath = "../files") {
     const role = message.author?.role ?? "unknown";
     if (role === "system" || role === "tool") return "";
-    const text = extractMessageText(message, fileExtMap);
+    const text = extractMessageText(message, fileExtMap, filesRelPath);
     if (!text.trim()) return "";
     const label = role === "user" ? "**You**" : "**Assistant**";
     const time = message.create_time ? ` _(${formatDate(message.create_time)})_` : "";
@@ -260,6 +260,7 @@ ${text}
     const title = conversation.title ?? "Untitled";
     const id = conversation.conversation_id ?? conversation.id ?? "";
     const model = conversation.default_model_slug ?? "unknown";
+    const projectName = options.projectName ?? (typeof conversation._projectName === "string" ? conversation._projectName : void 0);
     const frontmatterLines = [
       "---",
       `title: "${escapeYaml(title)}"`,
@@ -268,11 +269,13 @@ ${text}
       `update_time: ${formatDate(conversation.update_time)}`,
       `model: ${model}`,
       ...conversation.gizmo_id ? [`project_id: ${conversation.gizmo_id}`] : [],
+      ...projectName ? [`project: "${escapeYaml(projectName)}"`] : [],
       "---"
     ];
     const frontmatter = frontmatterLines.join("\n") + "\n\n";
     const fmap = options.fileExtMap ?? /* @__PURE__ */ new Map();
-    const toMd = (m) => messageToMarkdown(m, fmap);
+    const filesRel = options.filesRelPath ?? "../files";
+    const toMd = (m) => messageToMarkdown(m, fmap, filesRel);
     if (options.includeAllBranches) {
       const branches = getAllBranches(conversation);
       if (branches.length <= 1) {
@@ -363,6 +366,88 @@ ${body}`;
     const id8 = (conv.conversation_id ?? conv.id ?? "").slice(0, 8);
     return `${date} ${slug} ${id8}.md`;
   }
+  function slugifySegment(name) {
+    const slug = (name || "untitled").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+    return slug || "untitled";
+  }
+  function markdownExportPath(conv, meta = {}) {
+    const fname = obsidianFilename(conv);
+    const projectName = meta.projectName ?? (typeof conv._projectName === "string" ? conv._projectName : void 0);
+    if (projectName) {
+      return {
+        path: `markdown/projects/${slugifySegment(projectName)}/${fname}`,
+        filesRelPath: "../../files",
+        projectName,
+        archived: meta.archived
+      };
+    }
+    if (meta.archived || conv.is_archived === true) {
+      return {
+        path: `markdown/archived/${fname}`,
+        filesRelPath: "../../files",
+        archived: true
+      };
+    }
+    return {
+      path: `markdown/${fname}`,
+      filesRelPath: "../files",
+      archived: false
+    };
+  }
+  function buildExportIndexMarkdown(entries, opts = {}) {
+    const sorted = [...entries].sort((a, b) => {
+      const at = Number(a.updateTime ?? a.createTime ?? 0);
+      const bt = Number(b.updateTime ?? b.createTime ?? 0);
+      return bt - at;
+    });
+    const projects = /* @__PURE__ */ new Map();
+    const archived = [];
+    const inbox = [];
+    for (const e of sorted) {
+      if (e.projectName) {
+        const list = projects.get(e.projectName) ?? [];
+        list.push(e);
+        projects.set(e.projectName, list);
+      } else if (e.archived) {
+        archived.push(e);
+      } else {
+        inbox.push(e);
+      }
+    }
+    const lines = [
+      "# ChatLiberate Export Index",
+      "",
+      `Exported: ${opts.exportedAt ?? (/* @__PURE__ */ new Date()).toISOString()}`,
+      `Conversations: ${opts.conversationCount ?? entries.length}`,
+      `Projects: ${opts.projectCount ?? projects.size}`,
+      "",
+      "Jump to a chat below. Links open the Markdown file in this ZIP.",
+      ""
+    ];
+    const linkLine = (e) => {
+      const date = e.updateTime || e.createTime ? formatDate(e.updateTime ?? e.createTime).slice(0, 10) : "unknown";
+      return `- [${e.title || "Untitled"}](${e.path}) \u2014 ${date}`;
+    };
+    if (projects.size > 0) {
+      lines.push("## Projects", "");
+      for (const name of [...projects.keys()].sort((a, b) => a.localeCompare(b))) {
+        lines.push(`### ${name}`, "");
+        for (const e of projects.get(name)) lines.push(linkLine(e));
+        lines.push("");
+      }
+    }
+    if (inbox.length > 0) {
+      lines.push("## Chats", "");
+      for (const e of inbox) lines.push(linkLine(e));
+      lines.push("");
+    }
+    if (archived.length > 0) {
+      lines.push("## Archived", "");
+      for (const e of archived) lines.push(linkLine(e));
+      lines.push("");
+    }
+    return lines.join("\n");
+  }
   var CONVERSATIONS_PER_PAGE = 28;
   async function exportAllConversations(session, options = {}) {
     const {
@@ -403,6 +488,12 @@ ${body}`;
       await throttle.wait();
       try {
         const conv = await fetchConversation(session, summary.id);
+        if (summary._projectId || summary._projectName) {
+          conv._projectId = summary._projectId;
+          conv._projectName = summary._projectName;
+          if (!conv.gizmo_id && summary._projectId) conv.gizmo_id = summary._projectId;
+        }
+        if (summary._archived) conv.is_archived = true;
         conversations.push(conv);
         branchCount += countBranches(conv);
         if (summary._archived) archivedCount++;
@@ -601,7 +692,8 @@ ${ci.about_model}
       conversation_id: conv.conversation_id ?? conv.id
     }));
   }
-  function toMarkdownBundle(conversations, fileMeta) {
+  function toMarkdownExportLayout(conversations, opts = {}) {
+    const { fileMeta, index = [], exportedAt } = opts;
     const fileExtMap = /* @__PURE__ */ new Map();
     if (fileMeta) {
       for (const [fileId, meta] of fileMeta) {
@@ -622,12 +714,40 @@ ${ci.about_model}
         if (ext) fileExtMap.set(fileId, ext);
       }
     }
-    const bundle = /* @__PURE__ */ new Map();
+    const summaryById = new Map(index.map((s) => [s.id, s]));
+    const files = /* @__PURE__ */ new Map();
+    const entries = [];
+    const projectNames = /* @__PURE__ */ new Set();
     for (const conv of conversations) {
       const id = conv.conversation_id ?? conv.id ?? "unknown";
-      bundle.set(id, conversationToMarkdown(conv, { includeAllBranches: true, fileExtMap }));
+      const summary = summaryById.get(id);
+      const projectName = (typeof conv._projectName === "string" ? conv._projectName : void 0) ?? summary?._projectName;
+      const archived = Boolean(conv.is_archived ?? summary?._archived);
+      const pathInfo = markdownExportPath(conv, { projectName, archived });
+      const md = conversationToMarkdown(conv, {
+        includeAllBranches: true,
+        fileExtMap,
+        filesRelPath: pathInfo.filesRelPath,
+        projectName: pathInfo.projectName
+      });
+      files.set(pathInfo.path, md);
+      if (pathInfo.projectName) projectNames.add(pathInfo.projectName);
+      entries.push({
+        title: conv.title ?? "Untitled",
+        id,
+        path: pathInfo.path,
+        createTime: conv.create_time,
+        updateTime: conv.update_time,
+        projectName: pathInfo.projectName,
+        archived: pathInfo.archived
+      });
     }
-    return bundle;
+    const indexMarkdown = buildExportIndexMarkdown(entries, {
+      exportedAt: exportedAt ?? (/* @__PURE__ */ new Date()).toISOString(),
+      conversationCount: entries.length,
+      projectCount: projectNames.size
+    });
+    return { files, indexMarkdown, entries };
   }
   async function exportSingleConversation(session, conversationId, options = {}) {
     return exportAllConversations(session, {
@@ -1362,15 +1482,17 @@ ${ci.about_model}
     const files = {};
     const oai = toOpenAIExportFormat(result.conversations);
     files["conversations.json"] = JSON.stringify(oai, null, 2);
-    const mdBundle = toMarkdownBundle(result.conversations, result.fileMeta);
-    for (const [id, md] of mdBundle) {
-      const conv = result.conversations.find((c) => (c.conversation_id ?? c.id) === id);
-      const fname = conv ? obsidianFilename(conv) : `${id.slice(0, 8)}.md`;
-      files[`markdown/${fname}`] = md;
+    const layout = toMarkdownExportLayout(result.conversations, {
+      fileMeta: result.fileMeta,
+      index: result.index
+    });
+    files["INDEX.md"] = layout.indexMarkdown;
+    for (const [path, md] of layout.files) {
+      files[path] = md;
       const chunks = chunkMarkdown(md, 32e4);
       if (chunks.length > 1) {
         chunks.forEach((chunk, i) => {
-          files[`markdown/chunks/${fname.replace(".md", "")}-part${i + 1}.md`] = chunk;
+          files[path.replace(/\.md$/, `-part${i + 1}.md`)] = chunk;
         });
       }
     }
@@ -1401,15 +1523,20 @@ ${ci.about_model}
     }
     const contextBlock = toContextBlock(result.conversations, { maxChars: 6e4, fileExtMap });
     files["import-context-for-claude-gemini.md"] = contextBlock;
+    const projectNames = new Set(
+      layout.entries.filter((e) => e.projectName).map((e) => e.projectName)
+    );
     files["export-stats.json"] = JSON.stringify(
       {
         exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
         ...result.stats,
         tool: "chatliberate",
-        version: "0.1.0",
+        version: "0.1.1",
         accountType: document.cookie.includes("_account=") ? "teams/business" : "personal",
         memoriesCount: extras.memories?.length ?? 0,
-        hasCustomInstructions: Boolean(extras.customInstructions?.about_user || extras.customInstructions?.about_model)
+        hasCustomInstructions: Boolean(extras.customInstructions?.about_user || extras.customInstructions?.about_model),
+        projectNames: [...projectNames],
+        indexEntries: layout.entries.length
       },
       null,
       2

@@ -16,7 +16,12 @@ import {
 } from './auth.js';
 import type { ChatGPTSession } from './types.js';
 import { countBranches } from './branches.js';
-import { conversationToMarkdown, extractFileReferences } from './formatter.js';
+import {
+  buildExportIndexMarkdown,
+  conversationToMarkdown,
+  extractFileReferences,
+  markdownExportPath,
+} from './formatter.js';
 
 const CONVERSATIONS_PER_PAGE = 28;
 
@@ -72,6 +77,12 @@ export async function exportAllConversations(
 
     try {
       const conv = await fetchConversation(session, summary.id);
+      if (summary._projectId || summary._projectName) {
+        conv._projectId = summary._projectId;
+        conv._projectName = summary._projectName;
+        if (!conv.gizmo_id && summary._projectId) conv.gizmo_id = summary._projectId;
+      }
+      if (summary._archived) conv.is_archived = true;
       conversations.push(conv);
       branchCount += countBranches(conv);
       if (summary._archived) archivedCount++;
@@ -361,6 +372,86 @@ export function toMarkdownBundle(
     bundle.set(id, conversationToMarkdown(conv, { includeAllBranches: true, fileExtMap }));
   }
   return bundle;
+}
+
+export interface MarkdownExportLayout {
+  /** Full export-relative paths → markdown content */
+  files: Map<string, string>;
+  indexMarkdown: string;
+  entries: import('./formatter.js').ExportIndexEntry[];
+}
+
+/** Markdown tree with project/archived folders + searchable INDEX.md */
+export function toMarkdownExportLayout(
+  conversations: Conversation[],
+  opts: {
+    fileMeta?: Map<string, { contentType: string; fileName?: string }>;
+    index?: ConversationSummary[];
+    exportedAt?: string;
+  } = {},
+): MarkdownExportLayout {
+  const { fileMeta, index = [], exportedAt } = opts;
+
+  const fileExtMap = new Map<string, string>();
+  if (fileMeta) {
+    for (const [fileId, meta] of fileMeta) {
+      let ext = '';
+      if (meta.fileName) {
+        const dot = meta.fileName.lastIndexOf('.');
+        if (dot !== -1) ext = meta.fileName.slice(dot);
+      } else if (meta.contentType) {
+        const mime: Record<string, string> = {
+          'image/jpeg': '.jpeg', 'image/jpg': '.jpeg', 'image/png': '.png',
+          'image/gif': '.gif', 'image/webp': '.webp',
+        };
+        ext = mime[meta.contentType.split(';')[0].trim()] ?? '';
+      }
+      if (ext) fileExtMap.set(fileId, ext);
+    }
+  }
+
+  const summaryById = new Map(index.map((s) => [s.id, s]));
+  const files = new Map<string, string>();
+  const entries: import('./formatter.js').ExportIndexEntry[] = [];
+  const projectNames = new Set<string>();
+
+  for (const conv of conversations) {
+    const id = conv.conversation_id ?? conv.id ?? 'unknown';
+    const summary = summaryById.get(id);
+    const projectName =
+      (typeof conv._projectName === 'string' ? conv._projectName : undefined) ??
+      summary?._projectName;
+    const archived = Boolean(conv.is_archived ?? summary?._archived);
+
+    const pathInfo = markdownExportPath(conv, { projectName, archived });
+    const md = conversationToMarkdown(conv, {
+      includeAllBranches: true,
+      fileExtMap,
+      filesRelPath: pathInfo.filesRelPath,
+      projectName: pathInfo.projectName,
+    });
+    files.set(pathInfo.path, md);
+
+    if (pathInfo.projectName) projectNames.add(pathInfo.projectName);
+
+    entries.push({
+      title: conv.title ?? 'Untitled',
+      id,
+      path: pathInfo.path,
+      createTime: conv.create_time,
+      updateTime: conv.update_time,
+      projectName: pathInfo.projectName,
+      archived: pathInfo.archived,
+    });
+  }
+
+  const indexMarkdown = buildExportIndexMarkdown(entries, {
+    exportedAt: exportedAt ?? new Date().toISOString(),
+    conversationCount: entries.length,
+    projectCount: projectNames.size,
+  });
+
+  return { files, indexMarkdown, entries };
 }
 
 export async function exportSingleConversation(
