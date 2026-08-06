@@ -191,6 +191,32 @@
     }
     return files;
   }
+  var DIRECTIVE_OPEN = /^:::+[a-zA-Z][\w-]*(\{[^}]*\})?\s*$/;
+  var DIRECTIVE_CLOSE = /^:::+\s*$/;
+  var CODE_FENCE = /^(```|~~~)/;
+  function stripDirectiveMarkup(text) {
+    if (!text.includes(":::")) return text;
+    let inCodeFence = false;
+    const kept = text.split("\n").filter((line) => {
+      const trimmed = line.trim();
+      if (CODE_FENCE.test(trimmed)) {
+        inCodeFence = !inCodeFence;
+        return true;
+      }
+      if (inCodeFence) return true;
+      return !DIRECTIVE_OPEN.test(trimmed) && !DIRECTIVE_CLOSE.test(trimmed);
+    });
+    return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+  function dedupeParts(parts) {
+    const seen = /* @__PURE__ */ new Set();
+    return parts.filter((part) => {
+      const key = part.trim();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
   function extractPartText(p) {
     if (typeof p.text === "string" && p.text.trim()) return p.text.trim();
     if (typeof p.tether_id === "string") return "";
@@ -203,7 +229,8 @@
     const role = message.author?.role ?? "";
     if (role === "tool" || role === "system") return "";
     if (content.content_type === "text" && Array.isArray(content.parts)) {
-      return content.parts.map((p) => typeof p === "string" ? p : extractPartText(p)).filter(Boolean).join("\n");
+      const parts = content.parts.map((p) => typeof p === "string" ? p : extractPartText(p)).map(stripDirectiveMarkup).filter(Boolean);
+      return dedupeParts(parts).join("\n");
     }
     if (content.content_type === "code" && typeof content.text === "string") {
       const trimmed = content.text.trim();
@@ -220,8 +247,8 @@ ${content.text}
 \`\`\``;
     }
     if (content.content_type === "multimodal_text" && Array.isArray(content.parts)) {
-      return content.parts.map((part) => {
-        if (typeof part === "string") return part;
+      const parts = content.parts.map((part) => {
+        if (typeof part === "string") return stripDirectiveMarkup(part);
         if (part && typeof part === "object") {
           const p = part;
           if (p.content_type === "image_asset_pointer" && p.asset_pointer) {
@@ -229,10 +256,11 @@ ${content.text}
             const ext = fileExtMap.get(rawId) ?? "";
             return `![image](${filesRelPath}/${rawId}${ext})`;
           }
-          return extractPartText(p);
+          return stripDirectiveMarkup(extractPartText(p));
         }
         return "";
-      }).filter(Boolean).join("\n");
+      }).filter(Boolean);
+      return dedupeParts(parts).join("\n");
     }
     if (content.content_type === "thoughts" && Array.isArray(content.parts)) {
       const thoughts = content.parts.map((p) => typeof p === "object" && p && "summary" in p ? String(p.summary) : "").filter(Boolean).join("\n");

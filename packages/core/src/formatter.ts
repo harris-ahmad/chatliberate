@@ -80,6 +80,41 @@ export function extractFileReferences(conversation: Conversation): FileReference
   return files;
 }
 
+// ChatGPT wraps some replies in container directives such as
+// :::writing{variant="chat_message" id="47081"} … :::
+// The fences are internal markup, not content, so drop them but keep the body.
+const DIRECTIVE_OPEN = /^:::+[a-zA-Z][\w-]*(\{[^}]*\})?\s*$/;
+const DIRECTIVE_CLOSE = /^:::+\s*$/;
+const CODE_FENCE = /^(```|~~~)/;
+
+export function stripDirectiveMarkup(text: string): string {
+  if (!text.includes(':::')) return text;
+
+  let inCodeFence = false;
+  const kept = text.split('\n').filter((line) => {
+    const trimmed = line.trim();
+    if (CODE_FENCE.test(trimmed)) {
+      inCodeFence = !inCodeFence;
+      return true;
+    }
+    if (inCodeFence) return true;
+    return !DIRECTIVE_OPEN.test(trimmed) && !DIRECTIVE_CLOSE.test(trimmed);
+  });
+
+  return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** Drop repeated parts — ChatGPT sometimes emits the same block twice */
+function dedupeParts(parts: string[]): string[] {
+  const seen = new Set<string>();
+  return parts.filter((part) => {
+    const key = part.trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 /** Extract text from a dict-type message part (audio_transcription, tether_quote, etc.) */
 function extractPartText(p: Record<string, unknown>): string {
   // audio_transcription: { content_type: 'audio_transcription', text: '...', direction: 'in'|'out' }
@@ -104,10 +139,11 @@ export function extractMessageText(
   if (role === 'tool' || role === 'system') return '';
 
   if (content.content_type === 'text' && Array.isArray(content.parts)) {
-    return content.parts
+    const parts = content.parts
       .map((p) => (typeof p === 'string' ? p : extractPartText(p as Record<string, unknown>)))
-      .filter(Boolean)
-      .join('\n');
+      .map(stripDirectiveMarkup)
+      .filter(Boolean);
+    return dedupeParts(parts).join('\n');
   }
 
   if (content.content_type === 'code' && typeof content.text === 'string') {
@@ -126,9 +162,9 @@ export function extractMessageText(
   }
 
   if (content.content_type === 'multimodal_text' && Array.isArray(content.parts)) {
-    return content.parts
+    const parts = content.parts
       .map((part) => {
-        if (typeof part === 'string') return part;
+        if (typeof part === 'string') return stripDirectiveMarkup(part);
         if (part && typeof part === 'object') {
           const p = part as Record<string, unknown>;
           if (p.content_type === 'image_asset_pointer' && p.asset_pointer) {
@@ -138,12 +174,12 @@ export function extractMessageText(
             return `![image](${filesRelPath}/${rawId}${ext})`;
           }
           // audio_transcription, tether_quote, or any dict part with a text field
-          return extractPartText(p as Record<string, unknown>);
+          return stripDirectiveMarkup(extractPartText(p as Record<string, unknown>));
         }
         return '';
       })
-      .filter(Boolean)
-      .join('\n');
+      .filter(Boolean);
+    return dedupeParts(parts).join('\n');
   }
 
   if (content.content_type === 'thoughts' && Array.isArray(content.parts)) {
