@@ -3,7 +3,7 @@
   "name": "ChatLiberate — Export ChatGPT",
   "version": "0.1.4",
   "description": "One-click export for ALL ChatGPT conversations. Works on Business/Teams. Preserves branches & images.",
-  "permissions": ["activeTab", "storage"],
+  "permissions": ["activeTab", "storage", "unlimitedStorage"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.openai.com/*"

@@ -67,6 +67,12 @@ export interface FileReference {
   sizeBytes?: number;
 }
 
+export interface DownloadedConversation {
+  conversation: Conversation;
+  files: Map<string, Uint8Array>;
+  fileMeta: Map<string, { contentType: string; fileName?: string }>;
+}
+
 export interface ExportOptions {
   includeArchived?: boolean;
   includeProjects?: boolean;
@@ -76,6 +82,13 @@ export interface ExportOptions {
   onProgress?: (event: ExportProgressEvent) => void;
   signal?: AbortSignal;
   conversationIds?: string[];
+  /** Conversation ids already saved from a previous run — skip re-downloading. */
+  skipIds?: Iterable<string>;
+  /**
+   * Called after each conversation (and its files) finishes downloading, so a
+   * caller can persist it for resume. Runs once per newly downloaded chat.
+   */
+  onConversationDownloaded?: (downloaded: DownloadedConversation) => void | Promise<void>;
 }
 
 export interface ExportProgressEvent {

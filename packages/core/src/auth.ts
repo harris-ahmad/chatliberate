@@ -2,10 +2,21 @@ import type { ChatGPTSession } from './types.js';
 
 export type { ChatGPTSession };
 
-const API_BASE = 'https://chatgpt.com/backend-api';
+const DEFAULT_API_BASE = 'https://chatgpt.com/backend-api';
+const KNOWN_HOSTS = ['chatgpt.com', 'chat.openai.com'];
 
+/**
+ * In the browser, call the backend on the SAME origin the user is on — hitting
+ * chatgpt.com from a chat.openai.com page is a cross-origin request the session
+ * cookie/CORS won't allow. In Node (CLI) there's no location, so use the default.
+ */
 export function getApiBase(): string {
-  return API_BASE;
+  const origin =
+    typeof location !== 'undefined' && location?.origin ? location.origin : '';
+  if (origin && KNOWN_HOSTS.some((host) => origin.endsWith(host))) {
+    return `${origin}/backend-api`;
+  }
+  return DEFAULT_API_BASE;
 }
 
 export function createHeaders(session: ChatGPTSession): Record<string, string> {

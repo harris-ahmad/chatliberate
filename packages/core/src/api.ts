@@ -25,6 +25,27 @@ import {
 
 const CONVERSATIONS_PER_PAGE = 28;
 
+/**
+ * Decide which indexed conversations to actually download: restrict to
+ * `conversationIds` when given, then drop anything already saved (`skipIds`)
+ * so a resumed export only fetches what's missing. Pure — unit-testable.
+ */
+export function selectConversationsToDownload(
+  index: ConversationSummary[],
+  opts: { conversationIds?: string[]; skipIds?: Iterable<string> } = {},
+): ConversationSummary[] {
+  let selected = index;
+  if (opts.conversationIds?.length) {
+    const idSet = new Set(opts.conversationIds);
+    selected = selected.filter((c) => idSet.has(c.id));
+  }
+  const skip = new Set(opts.skipIds ?? []);
+  if (skip.size) {
+    selected = selected.filter((c) => !skip.has(c.id));
+  }
+  return selected;
+}
+
 export async function exportAllConversations(
   session: ChatGPTSession,
   options: ExportOptions = {},
@@ -38,6 +59,8 @@ export async function exportAllConversations(
     onProgress,
     signal,
     conversationIds,
+    skipIds,
+    onConversationDownloaded,
   } = options;
 
   const throttle = new Throttle(throttleMs);
@@ -52,11 +75,7 @@ export async function exportAllConversations(
 
   await indexConversations(session, index, { includeArchived, includeProjects }, throttle, emit, signal);
 
-  let toDownload = index;
-  if (conversationIds?.length) {
-    const idSet = new Set(conversationIds);
-    toDownload = index.filter((c) => idSet.has(c.id));
-  }
+  const toDownload = selectConversationsToDownload(index, { conversationIds, skipIds });
 
   emit({
     phase: 'downloading',
@@ -96,6 +115,9 @@ export async function exportAllConversations(
         conversationId: summary.id,
       });
 
+      const convFiles = new Map<string, Uint8Array>();
+      const convFileMeta = new Map<string, { contentType: string; fileName?: string }>();
+
       if (downloadFiles) {
         const refs = extractFileReferences(conv).filter((ref) => {
           if (ref.type === 'image') return downloadImages;
@@ -103,21 +125,33 @@ export async function exportAllConversations(
         });
 
         for (const ref of refs) {
-          if (files.has(ref.fileId)) continue;
+          const cached = files.get(ref.fileId);
+          if (cached) {
+            // Already downloaded for an earlier conversation — reuse for this
+            // conversation's resume payload so it stays self-contained.
+            convFiles.set(ref.fileId, cached);
+            const meta = fileMeta.get(ref.fileId);
+            if (meta) convFileMeta.set(ref.fileId, meta);
+            continue;
+          }
           await throttle.wait();
           try {
             const downloaded = await downloadFile(session, ref);
             if (downloaded) {
+              const meta = { contentType: downloaded.contentType, fileName: downloaded.fileName };
               files.set(ref.fileId, downloaded.data);
-              fileMeta.set(ref.fileId, {
-                contentType: downloaded.contentType,
-                fileName: downloaded.fileName,
-              });
+              fileMeta.set(ref.fileId, meta);
+              convFiles.set(ref.fileId, downloaded.data);
+              convFileMeta.set(ref.fileId, meta);
             }
           } catch {
             // Skip individual file failures
           }
         }
+      }
+
+      if (onConversationDownloaded) {
+        await onConversationDownloaded({ conversation: conv, files: convFiles, fileMeta: convFileMeta });
       }
     } catch (error) {
       emit({

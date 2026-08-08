@@ -364,6 +364,9 @@ export function toContextBlock(
   const formatMessages = (messages: ChatGPTMessage[]) =>
     messages
       .map((m) => {
+        // Drop ChatGPT's internal reasoning ("thoughts") — it's noise when
+        // seeding another model, and can be large. Kept in the markdown archive.
+        if (m.content?.content_type === 'thoughts') return '';
         const role = m.author?.role === 'user' ? 'User' : 'Assistant';
         let text = extractMessageText(m, fileExtMap).trim();
         if (!text) return '';

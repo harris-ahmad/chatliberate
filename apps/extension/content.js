@@ -1,8 +1,13 @@
 (() => {
   // packages/core/dist/index.js
-  var API_BASE = "https://chatgpt.com/backend-api";
+  var DEFAULT_API_BASE = "https://chatgpt.com/backend-api";
+  var KNOWN_HOSTS = ["chatgpt.com", "chat.openai.com"];
   function getApiBase() {
-    return API_BASE;
+    const origin = typeof location !== "undefined" && location?.origin ? location.origin : "";
+    if (origin && KNOWN_HOSTS.some((host) => origin.endsWith(host))) {
+      return `${origin}/backend-api`;
+    }
+    return DEFAULT_API_BASE;
   }
   function createHeaders(session) {
     const headers = {
@@ -461,6 +466,7 @@ ${body}`;
     const imageFileIds = [];
     const imgPattern = /!\[image\]\(\.\.\/files\/([^)]+)\)/g;
     const formatMessages = (messages) => messages.map((m) => {
+      if (m.content?.content_type === "thoughts") return "";
       const role = m.author?.role === "user" ? "User" : "Assistant";
       let text = extractMessageText(m, fileExtMap).trim();
       if (!text) return "";
@@ -656,6 +662,18 @@ ${sharedBlock}`;
     return lines.join("\n");
   }
   var CONVERSATIONS_PER_PAGE = 28;
+  function selectConversationsToDownload(index, opts = {}) {
+    let selected = index;
+    if (opts.conversationIds?.length) {
+      const idSet = new Set(opts.conversationIds);
+      selected = selected.filter((c) => idSet.has(c.id));
+    }
+    const skip = new Set(opts.skipIds ?? []);
+    if (skip.size) {
+      selected = selected.filter((c) => !skip.has(c.id));
+    }
+    return selected;
+  }
   async function exportAllConversations(session, options = {}) {
     const {
       includeArchived = true,
@@ -665,7 +683,9 @@ ${sharedBlock}`;
       throttleMs = 1500,
       onProgress,
       signal,
-      conversationIds
+      conversationIds,
+      skipIds,
+      onConversationDownloaded
     } = options;
     const throttle = new Throttle(throttleMs);
     const emit = (event) => onProgress?.(event);
@@ -675,11 +695,7 @@ ${sharedBlock}`;
     const fileMeta = /* @__PURE__ */ new Map();
     emit({ phase: "indexing", message: "Indexing conversations\u2026" });
     await indexConversations(session, index, { includeArchived, includeProjects }, throttle, emit, signal);
-    let toDownload = index;
-    if (conversationIds?.length) {
-      const idSet = new Set(conversationIds);
-      toDownload = index.filter((c) => idSet.has(c.id));
-    }
+    const toDownload = selectConversationsToDownload(index, { conversationIds, skipIds });
     emit({
       phase: "downloading",
       message: `Downloading ${toDownload.length} conversations\u2026`,
@@ -712,26 +728,37 @@ ${sharedBlock}`;
           total: toDownload.length,
           conversationId: summary.id
         });
+        const convFiles = /* @__PURE__ */ new Map();
+        const convFileMeta = /* @__PURE__ */ new Map();
         if (downloadFiles) {
           const refs = extractFileReferences(conv).filter((ref) => {
             if (ref.type === "image") return downloadImages;
             return true;
           });
           for (const ref of refs) {
-            if (files.has(ref.fileId)) continue;
+            const cached = files.get(ref.fileId);
+            if (cached) {
+              convFiles.set(ref.fileId, cached);
+              const meta = fileMeta.get(ref.fileId);
+              if (meta) convFileMeta.set(ref.fileId, meta);
+              continue;
+            }
             await throttle.wait();
             try {
               const downloaded = await downloadFile(session, ref);
               if (downloaded) {
+                const meta = { contentType: downloaded.contentType, fileName: downloaded.fileName };
                 files.set(ref.fileId, downloaded.data);
-                fileMeta.set(ref.fileId, {
-                  contentType: downloaded.contentType,
-                  fileName: downloaded.fileName
-                });
+                fileMeta.set(ref.fileId, meta);
+                convFiles.set(ref.fileId, downloaded.data);
+                convFileMeta.set(ref.fileId, meta);
               }
             } catch {
             }
           }
+        }
+        if (onConversationDownloaded) {
+          await onConversationDownloaded({ conversation: conv, files: convFiles, fileMeta: convFileMeta });
         }
       } catch (error) {
         emit({
@@ -1723,6 +1750,86 @@ ${ci.about_model}
     const match = window.location.pathname.match(/\/c\/([a-f0-9-]+)/i);
     return match?.[1];
   }
+  var RESUME_PREFIX = "resume:conv:";
+  function u8ToBase64(u82) {
+    let s = "";
+    const CHUNK = 32768;
+    for (let i = 0; i < u82.length; i += CHUNK) {
+      s += String.fromCharCode.apply(null, u82.subarray(i, i + CHUNK));
+    }
+    return btoa(s);
+  }
+  function base64ToU8(b64) {
+    const bin = atob(b64);
+    const u82 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u82[i] = bin.charCodeAt(i);
+    return u82;
+  }
+  async function resumeKeys() {
+    const all = await chrome.storage.local.get(null);
+    return Object.keys(all).filter((k) => k.startsWith(RESUME_PREFIX));
+  }
+  async function loadResumeCache() {
+    const all = await chrome.storage.local.get(null);
+    const convs = [];
+    const files = /* @__PURE__ */ new Map();
+    const fileMeta = /* @__PURE__ */ new Map();
+    for (const [key, val] of Object.entries(all)) {
+      if (!key.startsWith(RESUME_PREFIX) || !val?.conv) continue;
+      convs.push(val.conv);
+      for (const [fileId, b64] of Object.entries(val.files ?? {})) {
+        if (!files.has(fileId)) files.set(fileId, base64ToU8(b64));
+      }
+      for (const [fileId, meta] of Object.entries(val.fileMeta ?? {})) {
+        if (!fileMeta.has(fileId)) fileMeta.set(fileId, meta);
+      }
+    }
+    const ids = convs.map((c) => c.conversation_id ?? c.id).filter(Boolean);
+    return { convs, files, fileMeta, ids };
+  }
+  async function persistDownloadedConversation({ conversation, files, fileMeta }) {
+    const id = conversation.conversation_id ?? conversation.id;
+    if (!id) return;
+    const filesObj = {};
+    for (const [fileId, data] of files) filesObj[fileId] = u8ToBase64(data);
+    const metaObj = {};
+    for (const [fileId, meta] of fileMeta) metaObj[fileId] = meta;
+    try {
+      await chrome.storage.local.set({
+        [RESUME_PREFIX + id]: { conv: conversation, files: filesObj, fileMeta: metaObj, savedAt: Date.now() }
+      });
+    } catch (err2) {
+      console.warn("[ChatLiberate] could not persist resume state for", id, err2);
+    }
+  }
+  async function clearResumeCache() {
+    const keys = await resumeKeys();
+    if (keys.length) await chrome.storage.local.remove(keys);
+    await chrome.storage.local.remove("exportProgress");
+  }
+  function mergeExportResults(cache, fresh) {
+    const files = new Map(fresh.files);
+    for (const [k, v] of cache.files) if (!files.has(k)) files.set(k, v);
+    const fileMeta = new Map(fresh.fileMeta);
+    for (const [k, v] of cache.fileMeta) if (!fileMeta.has(k)) fileMeta.set(k, v);
+    const byId = /* @__PURE__ */ new Map();
+    for (const c of cache.convs) byId.set(c.conversation_id ?? c.id, c);
+    for (const c of fresh.conversations) byId.set(c.conversation_id ?? c.id, c);
+    const conversations = [...byId.values()];
+    return {
+      conversations,
+      files,
+      fileMeta,
+      index: fresh.index ?? [],
+      stats: {
+        conversationCount: conversations.length,
+        fileCount: files.size,
+        branchCount: conversations.reduce((n, c) => n + countBranches(c), 0),
+        archivedCount: conversations.filter((c) => c.is_archived === true).length,
+        projectCount: conversations.filter((c) => c.gizmo_id).length
+      }
+    };
+  }
   function detectChatBranchFromDom() {
     const candidates = Array.from(document.querySelectorAll("a, button, span, div"));
     const divider = candidates.find((el) => {
@@ -1873,28 +1980,19 @@ ${ci.about_model}
         onProgress: sendProgress
       });
     } else {
-      const stored = await chrome.storage.local.get("exportProgress");
-      const prevProgress = stored.exportProgress ?? {};
-      const skipIds = new Set(prevProgress.downloadedIds ?? []);
-      const abortController = new AbortController();
-      result = await exportAllConversations(session, {
+      const cache = await loadResumeCache();
+      const fresh = await exportAllConversations(session, {
         includeArchived: options.includeArchived,
         includeProjects: options.includeProjects,
         downloadFiles: options.downloadImages,
         downloadImages: options.downloadImages,
         throttleMs: 1200,
-        signal: abortController.signal,
-        onProgress: (event) => {
-          sendProgress(event);
-          if (event.phase === "downloading" && event.conversationId) {
-            const ids = [...prevProgress.downloadedIds ?? [], event.conversationId];
-            chrome.storage.local.set({ exportProgress: { downloadedIds: ids, lastExport: Date.now() } });
-          }
-          if (event.phase === "complete") {
-            chrome.storage.local.remove("exportProgress");
-          }
-        }
+        skipIds: cache.ids,
+        onProgress: sendProgress,
+        onConversationDownloaded: persistDownloadedConversation
       });
+      result = cache.convs.length ? mergeExportResults(cache, fresh) : fresh;
+      await clearResumeCache();
     }
     const zip = await buildZip(result, {
       memories,
