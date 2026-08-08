@@ -19,6 +19,104 @@ function getCurrentConversationId() {
   return match?.[1];
 }
 
+// ---- Resume cache -----------------------------------------------------------
+// Each downloaded conversation is persisted to chrome.storage.local under its
+// own key so an interrupted "Export All" can pick up where it left off. Binary
+// files are base64-encoded. Requires the "unlimitedStorage" permission.
+const RESUME_PREFIX = 'resume:conv:';
+
+function u8ToBase64(u8) {
+  let s = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < u8.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+  }
+  return btoa(s);
+}
+
+function base64ToU8(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+async function resumeKeys() {
+  const all = await chrome.storage.local.get(null);
+  return Object.keys(all).filter((k) => k.startsWith(RESUME_PREFIX));
+}
+
+async function loadResumeCache() {
+  const all = await chrome.storage.local.get(null);
+  const convs = [];
+  const files = new Map();
+  const fileMeta = new Map();
+  for (const [key, val] of Object.entries(all)) {
+    if (!key.startsWith(RESUME_PREFIX) || !val?.conv) continue;
+    convs.push(val.conv);
+    for (const [fileId, b64] of Object.entries(val.files ?? {})) {
+      if (!files.has(fileId)) files.set(fileId, base64ToU8(b64));
+    }
+    for (const [fileId, meta] of Object.entries(val.fileMeta ?? {})) {
+      if (!fileMeta.has(fileId)) fileMeta.set(fileId, meta);
+    }
+  }
+  const ids = convs.map((c) => c.conversation_id ?? c.id).filter(Boolean);
+  return { convs, files, fileMeta, ids };
+}
+
+async function persistDownloadedConversation({ conversation, files, fileMeta }) {
+  const id = conversation.conversation_id ?? conversation.id;
+  if (!id) return;
+  const filesObj = {};
+  for (const [fileId, data] of files) filesObj[fileId] = u8ToBase64(data);
+  const metaObj = {};
+  for (const [fileId, meta] of fileMeta) metaObj[fileId] = meta;
+  try {
+    await chrome.storage.local.set({
+      [RESUME_PREFIX + id]: { conv: conversation, files: filesObj, fileMeta: metaObj, savedAt: Date.now() },
+    });
+  } catch (err) {
+    // Out of quota or similar — resume just won't cover this chat; don't abort the export.
+    console.warn('[ChatLiberate] could not persist resume state for', id, err);
+  }
+}
+
+async function clearResumeCache() {
+  const keys = await resumeKeys();
+  if (keys.length) await chrome.storage.local.remove(keys);
+  // Drop the legacy progress key from older versions too.
+  await chrome.storage.local.remove('exportProgress');
+}
+
+/** Merge previously-saved conversations with the freshly downloaded ones. */
+function mergeExportResults(cache, fresh) {
+  const files = new Map(fresh.files);
+  for (const [k, v] of cache.files) if (!files.has(k)) files.set(k, v);
+  const fileMeta = new Map(fresh.fileMeta);
+  for (const [k, v] of cache.fileMeta) if (!fileMeta.has(k)) fileMeta.set(k, v);
+
+  // Fresh wins on id collisions (shouldn't happen — cached ids are skipped).
+  const byId = new Map();
+  for (const c of cache.convs) byId.set(c.conversation_id ?? c.id, c);
+  for (const c of fresh.conversations) byId.set(c.conversation_id ?? c.id, c);
+  const conversations = [...byId.values()];
+
+  return {
+    conversations,
+    files,
+    fileMeta,
+    index: fresh.index ?? [],
+    stats: {
+      conversationCount: conversations.length,
+      fileCount: files.size,
+      branchCount: conversations.reduce((n, c) => n + countBranches(c), 0),
+      archivedCount: conversations.filter((c) => c.is_archived === true).length,
+      projectCount: conversations.filter((c) => c.gizmo_id).length,
+    },
+  };
+}
+
 /**
  * ChatGPT's "Branch in new chat" shows a divider like
  * "Branched from Branch · SEO for React Apps". That fork is usually ONE
@@ -211,32 +309,26 @@ async function runExport(mode, options) {
       onProgress: sendProgress,
     });
   } else {
-    // Incremental resume: load previously downloaded IDs from chrome.storage
-    const stored = await chrome.storage.local.get('exportProgress');
-    const prevProgress = stored.exportProgress ?? {};
-    const skipIds = new Set(prevProgress.downloadedIds ?? []);
+    // Resume: reuse conversations saved by a previous (interrupted) run, and
+    // only download what's still missing. Each new chat is persisted as it
+    // completes, so a crash/close mid-export loses nothing.
+    const cache = await loadResumeCache();
 
-    const abortController = new AbortController();
-
-    result = await exportAllConversations(session, {
+    const fresh = await exportAllConversations(session, {
       includeArchived: options.includeArchived,
       includeProjects: options.includeProjects,
       downloadFiles: options.downloadImages,
       downloadImages: options.downloadImages,
       throttleMs: 1200,
-      signal: abortController.signal,
-      onProgress: (event) => {
-        sendProgress(event);
-        // Persist progress so a future session can resume
-        if (event.phase === 'downloading' && event.conversationId) {
-          const ids = [...(prevProgress.downloadedIds ?? []), event.conversationId];
-          chrome.storage.local.set({ exportProgress: { downloadedIds: ids, lastExport: Date.now() } });
-        }
-        if (event.phase === 'complete') {
-          chrome.storage.local.remove('exportProgress');
-        }
-      },
+      skipIds: cache.ids,
+      onProgress: sendProgress,
+      onConversationDownloaded: persistDownloadedConversation,
     });
+
+    result = cache.convs.length ? mergeExportResults(cache, fresh) : fresh;
+
+    // Export finished successfully — clear the resume cache.
+    await clearResumeCache();
   }
 
   const zip = await buildZip(result, {

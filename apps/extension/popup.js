@@ -31,17 +31,20 @@ async function init() {
       'Open <a href="https://chatgpt.com" target="_blank">chatgpt.com</a> first';
   }
 
-  // Show resume button if there's saved progress
-  const stored = await chrome.storage.local.get('exportProgress');
-  if (stored.exportProgress?.downloadedIds?.length) {
-    const count = stored.exportProgress.downloadedIds.length;
+  // Show resume state if a previous export was interrupted
+  const all = await chrome.storage.local.get(null);
+  const resumeCount = Object.keys(all).filter((k) => k.startsWith('resume:conv:')).length;
+  if (resumeCount) {
     clearResumeBtn.classList.remove('hidden');
-    clearResumeBtn.textContent = `Clear saved progress from last export (${count} chats)`;
+    clearResumeBtn.textContent = `${resumeCount} chats saved — next export resumes. Click to discard & start fresh`;
   }
 }
 
 clearResumeBtn.addEventListener('click', async () => {
-  await chrome.storage.local.remove('exportProgress');
+  const all = await chrome.storage.local.get(null);
+  const keys = Object.keys(all).filter((k) => k.startsWith('resume:conv:'));
+  keys.push('exportProgress'); // clear legacy key too
+  await chrome.storage.local.remove(keys);
   clearResumeBtn.classList.add('hidden');
 });
 

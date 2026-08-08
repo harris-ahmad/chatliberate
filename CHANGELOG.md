@@ -7,6 +7,12 @@
 - **Stripped ChatGPT's `Branch · ` title noise.** Branched chats arrive titled `Branch · Branch · SEO for React Apps`; the copied block now shows just `SEO for React Apps`.
 - **Rephrased the branch-split headers for the target model.** The ChatGPT-internal `#### Branched from Branch · …` label is replaced with plain framing — `Earlier context (carried over from a previous chat)` and `This branch continues from here` — so Claude/Gemini reads clean context instead of ChatGPT UI jargon.
 - **Hardened the branch split point.** A very short first branch message (e.g. `hey`) now requires an exact match, so it can't accidentally split on an earlier turn.
+- **Reasoning traces no longer leak into the copy.** ChatGPT's internal "thinking" is dropped from the pasted context block (it's still kept in the Markdown archive).
+
+### Fixed
+
+- **Works on `chat.openai.com`, not just `chatgpt.com`.** The backend origin is now derived from the page instead of being hardcoded, avoiding a cross-origin failure.
+- **Export resume actually resumes now.** An interrupted "Export All" saves each downloaded conversation (and its files) as it goes; the next run skips what's already saved and merges everything into one complete ZIP. Adds the `unlimitedStorage` permission to hold the cache.
 
 ## 0.1.3
 
