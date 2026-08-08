@@ -218,6 +218,8 @@
     const leaves = getLeafNodeIds(mapping);
     return leaves[0] ?? Object.keys(mapping)[0] ?? "";
   }
+  var CHAT_BRANCH_SHARED_LABEL = "_Earlier context (carried over from a previous chat):_";
+  var CHAT_BRANCH_CONTINUES_LABEL = "_This branch continues from here:_";
   function formatDate(timestamp) {
     if (!timestamp) return "unknown";
     try {
@@ -435,6 +437,12 @@ ${body}`;
     if (current) chunks.push(current);
     return chunks;
   }
+  function cleanChatTitle(title) {
+    const raw = (title ?? "").trim();
+    if (!raw) return "Untitled";
+    const cleaned = raw.replace(/(?:Branch\s*·\s*)+/gi, "").trim();
+    return cleaned || raw;
+  }
   function keepTail(text, budget) {
     if (text.length <= budget) return text;
     let tail = text.slice(text.length - budget);
@@ -472,6 +480,8 @@ ${body}`;
         splitAt = messages.findIndex((m) => {
           if (m.author?.role !== "user") return false;
           const text = extractMessageText(m, fileExtMap).replace(/\s+/g, " ").trim().toLowerCase();
+          if (!text) return false;
+          if (norm.length < 12) return text === norm;
           return text.startsWith(norm) || norm.startsWith(text.slice(0, 80));
         });
       }
@@ -480,19 +490,18 @@ ${body}`;
       }
       const shared = formatMessages(messages.slice(0, splitAt));
       const branched = formatMessages(messages.slice(splitAt));
-      const from = chatBranch?.label || "Branched chat";
       return [
-        "#### Shared history (before branch)",
+        CHAT_BRANCH_SHARED_LABEL,
         shared,
         "",
-        `#### ${from}`,
+        CHAT_BRANCH_CONTINUES_LABEL,
         branched
       ].filter((line, i, arr) => !(line === "" && arr[i - 1] === "")).join("\n");
     };
     const lines = [`<${label}>`, ""];
     let remaining = maxChars - label.length - 50;
     for (const conv of conversations) {
-      const title = conv.title ?? "Untitled";
+      const title = cleanChatTitle(conv.title);
       const header = `### ${title}
 `;
       let body;
@@ -1924,7 +1933,7 @@ ${ci.about_model}
       0
     );
     const dagBranches = options?.includeBranches && context.includes("regenerated branches preserved");
-    const chatFork = Boolean(chatBranch) && context.includes("Shared history (before branch)");
+    const chatFork = Boolean(chatBranch) && context.includes("This branch continues from here");
     return {
       ok: true,
       context,

@@ -129,8 +129,8 @@ test('toContextBlock honors the branched-from divider even with regen branches',
   assert.match(block, /Regen reply A/);
   assert.match(block, /Regen reply B/);
   // …and the branched-from split is applied to the shared history (not dropped)
-  assert.match(block, /#### Shared history \(before branch\)/);
-  assert.match(block, /#### Branched from Branch · Something/);
+  assert.match(block, /Earlier context \(carried over from a previous chat\)/);
+  assert.match(block, /This branch continues from here/);
   assert.match(block, /Original question/);
 });
 
@@ -188,8 +188,46 @@ test('toContextBlock splits ChatGPT “Branch in new chat” linear forks', () =
     },
   });
 
-  assert.match(block, /#### Shared history \(before branch\)/);
-  assert.match(block, /#### Branched from Branch · SEO for React Apps/);
+  assert.match(block, /Earlier context \(carried over from a previous chat\)/);
+  assert.match(block, /This branch continues from here/);
   assert.match(block, /SEO question/);
   assert.match(block, /this is a new branch from another branch/);
+  // Title cleaned: no "Branch · " noise in the header
+  assert.match(block, /### SEO for React Apps/);
+  assert.doesNotMatch(block, /Branch · /);
+});
+
+test('cleanChatTitle strips ChatGPT branch-prefix noise', async () => {
+  const { cleanChatTitle } = await import('../dist/index.js');
+  assert.equal(cleanChatTitle('Branch · Branch · Branch · SEO for React Apps'), 'SEO for React Apps');
+  assert.equal(cleanChatTitle('Normal title'), 'Normal title');
+  assert.equal(cleanChatTitle(''), 'Untitled');
+  assert.equal(cleanChatTitle(null), 'Untitled');
+});
+
+test('toContextBlock does not mis-split on a short repeated first message', () => {
+  // "hi" appears in shared history AND as the branch's first turn. With exact
+  // matching for short needles, the split must land on the FIRST exact "hi"
+  // (the earliest), never a loose prefix hit like "hidden costs".
+  const conv = {
+    title: 'Short needle',
+    current_node: 'a2',
+    conversation_id: 'sn-1',
+    mapping: {
+      root: { id: 'root', parent: null, children: ['u1'], message: null },
+      u1: { id: 'u1', parent: 'root', children: ['a1'], message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['hidden costs of SSR?'] } } },
+      a1: { id: 'a1', parent: 'u1', children: ['u2'], message: { author: { role: 'assistant' }, content: { content_type: 'text', parts: ['Here are the tradeoffs'] } } },
+      u2: { id: 'u2', parent: 'a1', children: ['a2'], message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['hi'] } } },
+      a2: { id: 'a2', parent: 'u2', children: [], message: { author: { role: 'assistant' }, content: { content_type: 'text', parts: ['Hey there'] } } },
+    },
+  };
+  const block = toContextBlock([conv], {
+    chatBranch: { label: 'Branched from X', firstUserText: 'hi' },
+  });
+  // The "hidden costs…" turn (loose prefix of "hi") stays in shared context,
+  // not treated as the branch start.
+  const sharedIdx = block.indexOf('Earlier context');
+  const continuesIdx = block.indexOf('This branch continues from here');
+  assert.ok(sharedIdx !== -1 && continuesIdx !== -1);
+  assert.ok(block.indexOf('hidden costs') < continuesIdx);
 });

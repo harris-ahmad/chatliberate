@@ -284,7 +284,7 @@ async function copyContextForCurrent(options) {
     0,
   );
   const dagBranches = options?.includeBranches && context.includes('regenerated branches preserved');
-  const chatFork = Boolean(chatBranch) && context.includes('Shared history (before branch)');
+  const chatFork = Boolean(chatBranch) && context.includes('This branch continues from here');
 
   return {
     ok: true,

@@ -1,13 +1,13 @@
 {
   "name": "@chatliberate/cli",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "CLI for exporting ChatGPT conversations — Business/Teams supported",
   "type": "module",
   "bin": {
     "chatliberate": "./bin/chatliberate.js"
   },
   "dependencies": {
-    "@chatliberate/core": "0.1.3"
+    "@chatliberate/core": "0.1.4"
   },
   "scripts": {
     "build": "echo 'CLI ready'"

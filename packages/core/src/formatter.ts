@@ -1,6 +1,14 @@
 import type { ChatGPTMessage, Conversation, FileReference } from './types.js';
 import { getActivePath, splitBranchesBySharedPrefix } from './branches.js';
 
+/**
+ * Headers used when a "Branch in new chat" fork is split. Phrased for the
+ * target model you paste into, not ChatGPT's internal UI. Exported so callers
+ * can detect that a split happened without brittle inline string matching.
+ */
+export const CHAT_BRANCH_SHARED_LABEL = '_Earlier context (carried over from a previous chat):_';
+export const CHAT_BRANCH_CONTINUES_LABEL = '_This branch continues from here:_';
+
 export function formatDate(timestamp?: number | string | null): string {
   if (!timestamp) return 'unknown';
   try {
@@ -298,6 +306,19 @@ export function chunkMarkdown(
   return chunks;
 }
 
+/**
+ * ChatGPT prepends "Branch · " to a title every time you "Branch in new chat",
+ * so branched chats arrive as "Branch · Branch · SEO for React Apps". That
+ * prefix is UI bookkeeping, meaningless to whatever model you paste into —
+ * strip the run. Leaves a normal title untouched.
+ */
+export function cleanChatTitle(title?: string | null): string {
+  const raw = (title ?? '').trim();
+  if (!raw) return 'Untitled';
+  const cleaned = raw.replace(/(?:Branch\s*·\s*)+/gi, '').trim();
+  return cleaned || raw;
+}
+
 /** Keep the last `budget` chars of `text`, trimmed to a clean line boundary. */
 function keepTail(text: string, budget: number): string {
   if (text.length <= budget) return text;
@@ -366,6 +387,10 @@ export function toContextBlock(
       splitAt = messages.findIndex((m) => {
         if (m.author?.role !== 'user') return false;
         const text = extractMessageText(m, fileExtMap).replace(/\s+/g, ' ').trim().toLowerCase();
+        if (!text) return false;
+        // Short first messages ("hey", "ok") are ambiguous — a loose prefix
+        // match could land on an earlier turn, so demand an exact match there.
+        if (norm.length < 12) return text === norm;
         return text.startsWith(norm) || norm.startsWith(text.slice(0, 80));
       });
     }
@@ -374,12 +399,11 @@ export function toContextBlock(
     }
     const shared = formatMessages(messages.slice(0, splitAt));
     const branched = formatMessages(messages.slice(splitAt));
-    const from = chatBranch?.label || 'Branched chat';
     return [
-      '#### Shared history (before branch)',
+      CHAT_BRANCH_SHARED_LABEL,
       shared,
       '',
-      `#### ${from}`,
+      CHAT_BRANCH_CONTINUES_LABEL,
       branched,
     ]
       .filter((line, i, arr) => !(line === '' && arr[i - 1] === ''))
@@ -390,7 +414,7 @@ export function toContextBlock(
   let remaining = maxChars - label.length - 50;
 
   for (const conv of conversations) {
-    const title = conv.title ?? 'Untitled';
+    const title = cleanChatTitle(conv.title);
     const header = `### ${title}\n`;
     let body: string;
 
