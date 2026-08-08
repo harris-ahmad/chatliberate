@@ -76,12 +76,27 @@ export interface DownloadedConversation {
 export interface ExportOptions {
   includeArchived?: boolean;
   includeProjects?: boolean;
+  /** Export only project conversations, skipping the regular list. */
+  projectsOnly?: boolean;
   downloadFiles?: boolean;
   downloadImages?: boolean;
+  /** Download canvas/textdoc assets (default true when downloadFiles). */
+  downloadCanvas?: boolean;
+  /** Download non-image file attachments (default true when downloadFiles). */
+  downloadAttachments?: boolean;
   throttleMs?: number;
   onProgress?: (event: ExportProgressEvent) => void;
   signal?: AbortSignal;
   conversationIds?: string[];
+  /** Restrict to these project (gizmo) ids. */
+  projectIds?: string[];
+  /** Cap the number of conversations downloaded this run. */
+  maxConversations?: number;
+  /**
+   * Incremental update: id → last-seen update_time. Conversations whose current
+   * update_time is unchanged are skipped (reuse the prior export's copy).
+   */
+  knownUpdateTimes?: Record<string, number>;
   /** Conversation ids already saved from a previous run — skip re-downloading. */
   skipIds?: Iterable<string>;
   /**
@@ -92,7 +107,7 @@ export interface ExportOptions {
 }
 
 export interface ExportProgressEvent {
-  phase: 'indexing' | 'downloading' | 'files' | 'complete' | 'error';
+  phase: 'indexing' | 'downloading' | 'files' | 'complete' | 'error' | 'rate-limited';
   message: string;
   current?: number;
   total?: number;

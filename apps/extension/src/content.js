@@ -293,6 +293,7 @@ function broadcast(payload) {
 function sendProgress(event) {
   broadcast({
     type: 'CHATLIBERATE_PROGRESS',
+    phase: event.phase,
     message: event.message,
     current: event.current,
     total: event.total,
@@ -400,8 +401,27 @@ async function copyContextForCurrent(options) {
   };
 }
 
+// One export at a time per tab. Without this, closing + reopening the popup and
+// clicking again starts a second concurrent export — doubling the request rate
+// and tripping ChatGPT's 429 rate limiter.
+let exportInProgress = false;
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.type === 'CHATLIBERATE_STATUS') {
+    sendResponse({ exporting: exportInProgress });
+    return true;
+  }
+
   if (msg.type === 'CHATLIBERATE_EXPORT') {
+    if (exportInProgress) {
+      sendResponse({
+        ok: false,
+        alreadyRunning: true,
+        error: 'An export is already running in this tab — let it finish (progress shows on the extension icon).',
+      });
+      return true;
+    }
+    exportInProgress = true;
     runExport(msg.mode, msg.options)
       .then((result) => {
         // Tell the background worker so the badge resolves even if the popup is closed.
@@ -411,6 +431,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       .catch((err) => {
         broadcast({ type: 'CHATLIBERATE_ERROR', error: err.message });
         sendResponse({ ok: false, error: err.message });
+      })
+      .finally(() => {
+        exportInProgress = false;
       });
     return true;
   }

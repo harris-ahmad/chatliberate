@@ -43,7 +43,21 @@
     const match = document.cookie.match(/(?:^|;\s*)_account=([^;]+)/);
     return match?.[1] ? decodeURIComponent(match[1]) : void 0;
   }
+  var rateLimitNotifier = null;
+  function setRateLimitNotifier(fn) {
+    rateLimitNotifier = fn;
+  }
+  function rateLimitWaitMs(retryAfterHeader, attempt) {
+    const retryAfter = parseInt(retryAfterHeader || "", 10);
+    if (Number.isFinite(retryAfter) && retryAfter > 0) return retryAfter * 1e3;
+    return (30 + attempt * 15) * 1e3;
+  }
+  function isRateLimitError(err2) {
+    return Boolean(err2?.rateLimited);
+  }
+  var MAX_RATE_LIMIT_ATTEMPTS = 3;
   async function fetchWithRetry(url, options, retries = 5) {
+    let rateLimitAttempts = 0;
     for (let attempt = 0; attempt < retries; attempt++) {
       const response = await fetch(url, options);
       if (response.status === 401 || response.status === 403) {
@@ -54,9 +68,16 @@
         throw error;
       }
       if (response.status === 429) {
-        const retryAfter = parseInt(response.headers.get("retry-after") || "60", 10);
-        const waitMs = (retryAfter > 0 ? retryAfter : 30 + attempt * 15) * 1e3;
+        rateLimitAttempts++;
+        if (rateLimitAttempts > MAX_RATE_LIMIT_ATTEMPTS) {
+          const error = new Error("ChatGPT is rate-limiting requests (HTTP 429).");
+          error.rateLimited = true;
+          throw error;
+        }
+        const waitMs = rateLimitWaitMs(response.headers.get("retry-after"), rateLimitAttempts);
+        rateLimitNotifier?.({ waitMs, attempt: rateLimitAttempts });
         await sleep(waitMs);
+        attempt--;
         continue;
       }
       if (!response.ok) {
@@ -90,6 +111,10 @@
       const remaining = this.ms - elapsed;
       if (remaining > 0) await sleep(remaining);
       this.lastRequest = Date.now();
+    }
+    /** Current spacing between requests, in ms. Grows via onRateLimit(). */
+    get intervalMs() {
+      return this.ms;
     }
     onRateLimit() {
       this.ms = Math.min(this.ms + 2e3, 12e4);
@@ -668,9 +693,23 @@ ${sharedBlock}`;
       const idSet = new Set(opts.conversationIds);
       selected = selected.filter((c) => idSet.has(c.id));
     }
+    if (opts.projectIds?.length) {
+      const projSet = new Set(opts.projectIds);
+      selected = selected.filter((c) => c._projectId && projSet.has(c._projectId));
+    }
     const skip = new Set(opts.skipIds ?? []);
     if (skip.size) {
       selected = selected.filter((c) => !skip.has(c.id));
+    }
+    if (opts.knownUpdateTimes) {
+      const known = opts.knownUpdateTimes;
+      selected = selected.filter((c) => {
+        const prev = known[c.id];
+        return prev === void 0 || Number(c.update_time ?? 0) > Number(prev);
+      });
+    }
+    if (opts.maxConversations && opts.maxConversations > 0) {
+      selected = selected.slice(0, opts.maxConversations);
     }
     return selected;
   }
@@ -678,12 +717,18 @@ ${sharedBlock}`;
     const {
       includeArchived = true,
       includeProjects = true,
+      projectsOnly = false,
       downloadFiles = true,
       downloadImages = true,
+      downloadCanvas = true,
+      downloadAttachments = true,
       throttleMs = 1500,
       onProgress,
       signal,
       conversationIds,
+      projectIds,
+      maxConversations,
+      knownUpdateTimes,
       skipIds,
       onConversationDownloaded
     } = options;
@@ -693,99 +738,131 @@ ${sharedBlock}`;
     const conversations = [];
     const files = /* @__PURE__ */ new Map();
     const fileMeta = /* @__PURE__ */ new Map();
-    emit({ phase: "indexing", message: "Indexing conversations\u2026" });
-    await indexConversations(session, index, { includeArchived, includeProjects }, throttle, emit, signal);
-    const toDownload = selectConversationsToDownload(index, { conversationIds, skipIds });
-    emit({
-      phase: "downloading",
-      message: `Downloading ${toDownload.length} conversations\u2026`,
-      total: toDownload.length,
-      current: 0
+    setRateLimitNotifier(({ waitMs }) => {
+      throttle.onRateLimit();
+      emit({
+        phase: "rate-limited",
+        message: `Rate-limited by ChatGPT \u2014 waiting ${Math.round(waitMs / 1e3)}s, then slowing to ${(throttle.intervalMs / 1e3).toFixed(1)}s between requests\u2026`
+      });
     });
-    let branchCount = 0;
-    let archivedCount = 0;
-    let projectCount = 0;
-    for (let i = 0; i < toDownload.length; i++) {
-      if (signal?.aborted) throw new Error("Export cancelled");
-      const summary = toDownload[i];
-      await throttle.wait();
-      try {
-        const conv = await fetchConversation(session, summary.id);
-        if (summary._projectId || summary._projectName) {
-          conv._projectId = summary._projectId;
-          conv._projectName = summary._projectName;
-          if (!conv.gizmo_id && summary._projectId) conv.gizmo_id = summary._projectId;
-        }
-        if (summary._archived) conv.is_archived = true;
-        conversations.push(conv);
-        branchCount += countBranches(conv);
-        if (summary._archived) archivedCount++;
-        if (summary._projectId) projectCount++;
-        emit({
-          phase: "downloading",
-          message: `Downloaded: ${summary.title ?? summary.id}`,
-          current: i + 1,
-          total: toDownload.length,
-          conversationId: summary.id
-        });
-        const convFiles = /* @__PURE__ */ new Map();
-        const convFileMeta = /* @__PURE__ */ new Map();
-        if (downloadFiles) {
-          const refs = extractFileReferences(conv).filter((ref) => {
-            if (ref.type === "image") return downloadImages;
-            return true;
+    try {
+      emit({ phase: "indexing", message: "Indexing conversations\u2026" });
+      await indexConversations(
+        session,
+        index,
+        { includeArchived, includeProjects, projectsOnly },
+        throttle,
+        emit,
+        signal
+      );
+      const toDownload = selectConversationsToDownload(index, {
+        conversationIds,
+        projectIds,
+        skipIds,
+        knownUpdateTimes,
+        maxConversations
+      });
+      emit({
+        phase: "downloading",
+        message: `Downloading ${toDownload.length} conversations\u2026`,
+        total: toDownload.length,
+        current: 0
+      });
+      let branchCount = 0;
+      let archivedCount = 0;
+      let projectCount = 0;
+      for (let i = 0; i < toDownload.length; i++) {
+        if (signal?.aborted) throw new Error("Export cancelled");
+        const summary = toDownload[i];
+        await throttle.wait();
+        try {
+          const conv = await fetchConversation(session, summary.id);
+          if (summary._projectId || summary._projectName) {
+            conv._projectId = summary._projectId;
+            conv._projectName = summary._projectName;
+            if (!conv.gizmo_id && summary._projectId) conv.gizmo_id = summary._projectId;
+          }
+          if (summary._archived) conv.is_archived = true;
+          conversations.push(conv);
+          branchCount += countBranches(conv);
+          if (summary._archived) archivedCount++;
+          if (summary._projectId) projectCount++;
+          emit({
+            phase: "downloading",
+            message: `Downloaded: ${summary.title ?? summary.id}`,
+            current: i + 1,
+            total: toDownload.length,
+            conversationId: summary.id
           });
-          for (const ref of refs) {
-            const cached = files.get(ref.fileId);
-            if (cached) {
-              convFiles.set(ref.fileId, cached);
-              const meta = fileMeta.get(ref.fileId);
-              if (meta) convFileMeta.set(ref.fileId, meta);
-              continue;
-            }
-            await throttle.wait();
-            try {
-              const downloaded = await downloadFile(session, ref);
-              if (downloaded) {
-                const meta = { contentType: downloaded.contentType, fileName: downloaded.fileName };
-                files.set(ref.fileId, downloaded.data);
-                fileMeta.set(ref.fileId, meta);
-                convFiles.set(ref.fileId, downloaded.data);
-                convFileMeta.set(ref.fileId, meta);
+          const convFiles = /* @__PURE__ */ new Map();
+          const convFileMeta = /* @__PURE__ */ new Map();
+          if (downloadFiles) {
+            const refs = extractFileReferences(conv).filter((ref) => {
+              if (ref.type === "image") return downloadImages;
+              if (ref.type === "canvas") return downloadCanvas;
+              if (ref.type === "attachment") return downloadAttachments;
+              return true;
+            });
+            for (const ref of refs) {
+              const cached = files.get(ref.fileId);
+              if (cached) {
+                convFiles.set(ref.fileId, cached);
+                const meta = fileMeta.get(ref.fileId);
+                if (meta) convFileMeta.set(ref.fileId, meta);
+                continue;
               }
-            } catch {
+              await throttle.wait();
+              try {
+                const downloaded = await downloadFile(session, ref);
+                if (downloaded) {
+                  const meta = { contentType: downloaded.contentType, fileName: downloaded.fileName };
+                  files.set(ref.fileId, downloaded.data);
+                  fileMeta.set(ref.fileId, meta);
+                  convFiles.set(ref.fileId, downloaded.data);
+                  convFileMeta.set(ref.fileId, meta);
+                }
+              } catch {
+              }
             }
           }
+          if (onConversationDownloaded) {
+            await onConversationDownloaded({ conversation: conv, files: convFiles, fileMeta: convFileMeta });
+          }
+        } catch (error) {
+          if (isRateLimitError(error)) {
+            throw new Error(
+              "Export paused \u2014 ChatGPT is rate-limiting (HTTP 429). Your progress is saved; wait a few minutes and run Export again to resume."
+            );
+          }
+          emit({
+            phase: "error",
+            message: `Failed: ${summary.title ?? summary.id} \u2014 ${error.message}`,
+            conversationId: summary.id
+          });
         }
-        if (onConversationDownloaded) {
-          await onConversationDownloaded({ conversation: conv, files: convFiles, fileMeta: convFileMeta });
-        }
-      } catch (error) {
-        emit({
-          phase: "error",
-          message: `Failed: ${summary.title ?? summary.id} \u2014 ${error.message}`,
-          conversationId: summary.id
-        });
       }
+      emit({ phase: "complete", message: "Export complete", current: conversations.length, total: toDownload.length });
+      return {
+        conversations,
+        files,
+        fileMeta,
+        index: toDownload,
+        stats: {
+          conversationCount: conversations.length,
+          fileCount: files.size,
+          branchCount,
+          archivedCount,
+          projectCount
+        }
+      };
+    } finally {
+      setRateLimitNotifier(null);
     }
-    emit({ phase: "complete", message: "Export complete", current: conversations.length, total: toDownload.length });
-    return {
-      conversations,
-      files,
-      fileMeta,
-      index: toDownload,
-      stats: {
-        conversationCount: conversations.length,
-        fileCount: files.size,
-        branchCount,
-        archivedCount,
-        projectCount
-      }
-    };
   }
   async function indexConversations(session, index, opts, throttle, emit, signal) {
     const seen = /* @__PURE__ */ new Set();
-    for (const archived of [false, ...opts.includeArchived ? [true] : []]) {
+    const listPasses = opts.projectsOnly ? [] : [false, ...opts.includeArchived ? [true] : []];
+    for (const archived of listPasses) {
       let offset = 0;
       let hasMore = true;
       while (hasMore) {
@@ -810,7 +887,7 @@ ${sharedBlock}`;
         hasMore = items.length === CONVERSATIONS_PER_PAGE;
       }
     }
-    if (opts.includeProjects) {
+    if (opts.includeProjects || opts.projectsOnly) {
       await throttle.wait();
       const projects = await fetchProjects(session);
       for (const project of projects) {
@@ -1966,6 +2043,7 @@ ${ci.about_model}
   function sendProgress(event) {
     broadcast({
       type: "CHATLIBERATE_PROGRESS",
+      phase: event.phase,
       message: event.message,
       current: event.current,
       total: event.total
@@ -2050,14 +2128,30 @@ ${ci.about_model}
       chatBranchLabel: chatBranch?.label
     };
   }
+  var exportInProgress = false;
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.type === "CHATLIBERATE_STATUS") {
+      sendResponse({ exporting: exportInProgress });
+      return true;
+    }
     if (msg.type === "CHATLIBERATE_EXPORT") {
+      if (exportInProgress) {
+        sendResponse({
+          ok: false,
+          alreadyRunning: true,
+          error: "An export is already running in this tab \u2014 let it finish (progress shows on the extension icon)."
+        });
+        return true;
+      }
+      exportInProgress = true;
       runExport(msg.mode, msg.options).then((result) => {
         broadcast({ type: "CHATLIBERATE_DONE", stats: result.stats });
         sendResponse(result);
       }).catch((err2) => {
         broadcast({ type: "CHATLIBERATE_ERROR", error: err2.message });
         sendResponse({ ok: false, error: err2.message });
+      }).finally(() => {
+        exportInProgress = false;
       });
       return true;
     }

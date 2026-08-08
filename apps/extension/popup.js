@@ -26,6 +26,20 @@ async function init() {
     exportCurrentBtn.disabled = !onConvo;
     copyContextBtn.disabled = !onConvo;
     exportPdfBtn.disabled = !onConvo;
+
+    // If an export is already running in this tab, reflect it so the user can't
+    // start a second one (which would double the request rate and hit 429s).
+    try {
+      const st = await chrome.tabs.sendMessage(tab.id, { type: 'CHATLIBERATE_STATUS' });
+      if (st?.exporting) {
+        exportAllBtn.disabled = true;
+        exportCurrentBtn.disabled = true;
+        showProgress('Export running in the background…', 10);
+        bgHint.classList.remove('hidden');
+      }
+    } catch {
+      // Content script not ready yet — ignore.
+    }
   } else {
     statusEl.className = 'status warn';
     statusEl.innerHTML =
@@ -77,6 +91,15 @@ async function sendExport(mode) {
       mode,
       options: getOptions(),
     });
+
+    if (response?.alreadyRunning) {
+      // Not a failure — an export is already in flight in the tab.
+      statusEl.className = 'status ok';
+      statusEl.textContent = response.error;
+      showProgress('Export already running…', 10);
+      bgHint.classList.remove('hidden');
+      return;
+    }
 
     if (!response?.ok) {
       throw new Error(response?.error ?? 'Export failed');

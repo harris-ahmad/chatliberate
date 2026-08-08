@@ -7,6 +7,7 @@
 
 const BADGE_OK = '#10a37f';
 const BADGE_ERR = '#d93b3b';
+const BADGE_WAIT = '#e08a00';
 
 function setBadge(text, color) {
   chrome.action.setBadgeBackgroundColor({ color: color ?? BADGE_OK });
@@ -24,6 +25,10 @@ chrome.runtime.onMessage.addListener((msg) => {
 
   switch (msg.type) {
     case 'CHATLIBERATE_PROGRESS': {
+      if (msg.phase === 'rate-limited') {
+        setBadge('429', BADGE_WAIT);
+        break;
+      }
       let text = '…';
       if (msg.total && Number.isFinite(msg.current)) {
         const pct = Math.min(99, Math.max(0, Math.round((msg.current / msg.total) * 100)));

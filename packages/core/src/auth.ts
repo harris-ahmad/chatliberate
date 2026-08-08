@@ -71,11 +71,40 @@ export function decodeUserIdFromToken(token: string): string | undefined {
   }
 }
 
+export interface RateLimitInfo {
+  waitMs: number;
+  attempt: number;
+}
+
+let rateLimitNotifier: ((info: RateLimitInfo) => void) | null = null;
+
+/** Register a callback invoked each time a request is delayed by a 429. */
+export function setRateLimitNotifier(fn: ((info: RateLimitInfo) => void) | null): void {
+  rateLimitNotifier = fn;
+}
+
+/** Milliseconds to wait after a 429 — honors Retry-After, else backs off. */
+export function rateLimitWaitMs(retryAfterHeader: string | null, attempt: number): number {
+  const retryAfter = parseInt(retryAfterHeader || '', 10);
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return retryAfter * 1000;
+  return (30 + attempt * 15) * 1000;
+}
+
+export function isRateLimitError(err: unknown): boolean {
+  return Boolean((err as { rateLimited?: boolean } | null | undefined)?.rateLimited);
+}
+
+// After this many consecutive 429s on one request, give up and surface a tagged
+// error so the caller can stop hammering instead of grinding through retries.
+const MAX_RATE_LIMIT_ATTEMPTS = 3;
+
 export async function fetchWithRetry(
   url: string,
   options: RequestInit,
   retries = 5,
 ): Promise<Response> {
+  let rateLimitAttempts = 0;
+
   for (let attempt = 0; attempt < retries; attempt++) {
     const response = await fetch(url, options);
 
@@ -88,9 +117,16 @@ export async function fetchWithRetry(
     }
 
     if (response.status === 429) {
-      const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
-      const waitMs = (retryAfter > 0 ? retryAfter : 30 + attempt * 15) * 1000;
+      rateLimitAttempts++;
+      if (rateLimitAttempts > MAX_RATE_LIMIT_ATTEMPTS) {
+        const error = new Error('ChatGPT is rate-limiting requests (HTTP 429).');
+        (error as Error & { rateLimited?: boolean }).rateLimited = true;
+        throw error;
+      }
+      const waitMs = rateLimitWaitMs(response.headers.get('retry-after'), rateLimitAttempts);
+      rateLimitNotifier?.({ waitMs, attempt: rateLimitAttempts });
       await sleep(waitMs);
+      attempt--; // don't let 429 waits consume the general (non-429) retry budget
       continue;
     }
 
@@ -128,6 +164,11 @@ export class Throttle {
     const remaining = this.ms - elapsed;
     if (remaining > 0) await sleep(remaining);
     this.lastRequest = Date.now();
+  }
+
+  /** Current spacing between requests, in ms. Grows via onRateLimit(). */
+  get intervalMs(): number {
+    return this.ms;
   }
 
   onRateLimit(): void {

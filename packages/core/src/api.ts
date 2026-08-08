@@ -12,6 +12,8 @@ import {
   createHeaders,
   fetchWithRetry,
   getApiBase,
+  isRateLimitError,
+  setRateLimitNotifier,
   Throttle,
 } from './auth.js';
 import type { ChatGPTSession } from './types.js';
@@ -26,23 +28,51 @@ import {
 const CONVERSATIONS_PER_PAGE = 28;
 
 /**
- * Decide which indexed conversations to actually download: restrict to
- * `conversationIds` when given, then drop anything already saved (`skipIds`)
- * so a resumed export only fetches what's missing. Pure — unit-testable.
+ * Decide which indexed conversations to actually download. Filters, in order:
+ * restrict to `conversationIds` / `projectIds`; drop already-saved `skipIds`
+ * (resume); drop unchanged ones by `knownUpdateTimes` (incremental --update);
+ * finally cap at `maxConversations`. Pure — unit-testable.
  */
 export function selectConversationsToDownload(
   index: ConversationSummary[],
-  opts: { conversationIds?: string[]; skipIds?: Iterable<string> } = {},
+  opts: {
+    conversationIds?: string[];
+    projectIds?: string[];
+    skipIds?: Iterable<string>;
+    knownUpdateTimes?: Record<string, number>;
+    maxConversations?: number;
+  } = {},
 ): ConversationSummary[] {
   let selected = index;
+
   if (opts.conversationIds?.length) {
     const idSet = new Set(opts.conversationIds);
     selected = selected.filter((c) => idSet.has(c.id));
   }
+
+  if (opts.projectIds?.length) {
+    const projSet = new Set(opts.projectIds);
+    selected = selected.filter((c) => c._projectId && projSet.has(c._projectId));
+  }
+
   const skip = new Set(opts.skipIds ?? []);
   if (skip.size) {
     selected = selected.filter((c) => !skip.has(c.id));
   }
+
+  if (opts.knownUpdateTimes) {
+    const known = opts.knownUpdateTimes;
+    selected = selected.filter((c) => {
+      const prev = known[c.id];
+      // Keep if new, or if the server's copy is newer than what we have.
+      return prev === undefined || Number(c.update_time ?? 0) > Number(prev);
+    });
+  }
+
+  if (opts.maxConversations && opts.maxConversations > 0) {
+    selected = selected.slice(0, opts.maxConversations);
+  }
+
   return selected;
 }
 
@@ -53,12 +83,18 @@ export async function exportAllConversations(
   const {
     includeArchived = true,
     includeProjects = true,
+    projectsOnly = false,
     downloadFiles = true,
     downloadImages = true,
+    downloadCanvas = true,
+    downloadAttachments = true,
     throttleMs = 1500,
     onProgress,
     signal,
     conversationIds,
+    projectIds,
+    maxConversations,
+    knownUpdateTimes,
     skipIds,
     onConversationDownloaded,
   } = options;
@@ -71,11 +107,37 @@ export async function exportAllConversations(
   const files = new Map<string, Uint8Array>();
   const fileMeta = new Map<string, { contentType: string; fileName?: string }>();
 
+  // On each 429: surface the wait to the UI, and permanently slow the pace for
+  // the rest of this run so we stop tripping the same limit (adaptive backoff).
+  setRateLimitNotifier(({ waitMs }) => {
+    throttle.onRateLimit();
+    emit({
+      phase: 'rate-limited',
+      message: `Rate-limited by ChatGPT — waiting ${Math.round(waitMs / 1000)}s, then slowing to ${(
+        throttle.intervalMs / 1000
+      ).toFixed(1)}s between requests…`,
+    });
+  });
+
+  try {
   emit({ phase: 'indexing', message: 'Indexing conversations…' });
 
-  await indexConversations(session, index, { includeArchived, includeProjects }, throttle, emit, signal);
+  await indexConversations(
+    session,
+    index,
+    { includeArchived, includeProjects, projectsOnly },
+    throttle,
+    emit,
+    signal,
+  );
 
-  const toDownload = selectConversationsToDownload(index, { conversationIds, skipIds });
+  const toDownload = selectConversationsToDownload(index, {
+    conversationIds,
+    projectIds,
+    skipIds,
+    knownUpdateTimes,
+    maxConversations,
+  });
 
   emit({
     phase: 'downloading',
@@ -121,6 +183,8 @@ export async function exportAllConversations(
       if (downloadFiles) {
         const refs = extractFileReferences(conv).filter((ref) => {
           if (ref.type === 'image') return downloadImages;
+          if (ref.type === 'canvas') return downloadCanvas;
+          if (ref.type === 'attachment') return downloadAttachments;
           return true;
         });
 
@@ -154,6 +218,13 @@ export async function exportAllConversations(
         await onConversationDownloaded({ conversation: conv, files: convFiles, fileMeta: convFileMeta });
       }
     } catch (error) {
+      // fetchWithRetry already backed off several times; if it's still 429,
+      // stop hammering. Resume has saved everything downloaded so far.
+      if (isRateLimitError(error)) {
+        throw new Error(
+          'Export paused — ChatGPT is rate-limiting (HTTP 429). Your progress is saved; wait a few minutes and run Export again to resume.',
+        );
+      }
       emit({
         phase: 'error',
         message: `Failed: ${summary.title ?? summary.id} — ${(error as Error).message}`,
@@ -177,19 +248,27 @@ export async function exportAllConversations(
       projectCount,
     },
   };
+  } finally {
+    setRateLimitNotifier(null);
+  }
 }
 
 async function indexConversations(
   session: ChatGPTSession,
   index: ConversationSummary[],
-  opts: { includeArchived: boolean; includeProjects: boolean },
+  opts: { includeArchived: boolean; includeProjects: boolean; projectsOnly?: boolean },
   throttle: Throttle,
   emit: (e: ExportProgressEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   const seen = new Set<string>();
 
-  for (const archived of [false, ...(opts.includeArchived ? [true] : [])]) {
+  // projectsOnly: skip the regular (and archived) conversation lists entirely.
+  const listPasses = opts.projectsOnly
+    ? []
+    : [false, ...(opts.includeArchived ? [true] : [])];
+
+  for (const archived of listPasses) {
     let offset = 0;
     let hasMore = true;
 
@@ -220,7 +299,7 @@ async function indexConversations(
     }
   }
 
-  if (opts.includeProjects) {
+  if (opts.includeProjects || opts.projectsOnly) {
     await throttle.wait();
     const projects = await fetchProjects(session);
 
