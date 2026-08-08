@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+### Improved — cleaner copy output for "Branch in new chat" forks
+
+- **Stripped ChatGPT's `Branch · ` title noise.** Branched chats arrive titled `Branch · Branch · SEO for React Apps`; the copied block now shows just `SEO for React Apps`.
+- **Rephrased the branch-split headers for the target model.** The ChatGPT-internal `#### Branched from Branch · …` label is replaced with plain framing — `Earlier context (carried over from a previous chat)` and `This branch continues from here` — so Claude/Gemini reads clean context instead of ChatGPT UI jargon.
+- **Hardened the branch split point.** A very short first branch message (e.g. `hey`) now requires an exact match, so it can't accidentally split on an earlier turn.
+
 ## 0.1.3
 
 ### Fixed — one-click "Copy for Claude/Gemini"

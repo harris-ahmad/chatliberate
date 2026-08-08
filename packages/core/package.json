@@ -1,6 +1,6 @@
 {
   "name": "@chatliberate/core",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "ChatGPT export engine — Business/Teams, branches, images, OAI format",
   "type": "module",
   "main": "./dist/index.js",
