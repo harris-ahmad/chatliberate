@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getAllBranches, getActivePath, countBranches } from '../dist/index.js';
+import {
+  getAllBranches,
+  getActivePath,
+  countBranches,
+  splitBranchesBySharedPrefix,
+} from '../dist/index.js';
 
 const sampleConversation = {
   title: 'Branch test',
@@ -166,6 +171,40 @@ test('getAllBranches finds forks that only share a parent pointer', () => {
   assert.equal(branches[0].nodeIds.at(-1), 'asst-b');
   const texts = branches.map((b) => b.messages.at(-1)?.content?.parts?.[0]).sort();
   assert.deepEqual(texts, ['Response A', 'Response B']);
+});
+
+test('splitBranchesBySharedPrefix pulls the common prefix out once', () => {
+  const view = splitBranchesBySharedPrefix(sampleConversation);
+  // Shared prefix is the "Hello" user turn; each tail is one distinct reply
+  assert.equal(view.count, 2);
+  assert.deepEqual(view.shared.map((m) => m.content?.parts?.[0]), ['Hello']);
+  const tails = view.branches.map((b) => b.messages.map((m) => m.content?.parts?.[0]));
+  assert.deepEqual(tails, [['Response B'], ['Response A']]);
+  assert.equal(view.branches[0].isActive, true);
+  assert.equal(view.branches[1].isActive, false);
+});
+
+test('splitBranchesBySharedPrefix returns null for linear chats', () => {
+  const linear = {
+    title: 'Linear',
+    current_node: 'a1',
+    mapping: {
+      root: { id: 'root', parent: null, children: ['u1'], message: null },
+      u1: {
+        id: 'u1',
+        parent: 'root',
+        children: ['a1'],
+        message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['Hi'] } },
+      },
+      a1: {
+        id: 'a1',
+        parent: 'u1',
+        children: [],
+        message: { author: { role: 'assistant' }, content: { content_type: 'text', parts: ['Yo'] } },
+      },
+    },
+  };
+  assert.equal(splitBranchesBySharedPrefix(linear), null);
 });
 
 test('linear parent-pointer chat stays one branch', () => {

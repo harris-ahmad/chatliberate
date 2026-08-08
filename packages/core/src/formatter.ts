@@ -1,5 +1,5 @@
 import type { ChatGPTMessage, Conversation, FileReference } from './types.js';
-import { getActivePath, getAllBranches } from './branches.js';
+import { getActivePath, splitBranchesBySharedPrefix } from './branches.js';
 
 export function formatDate(timestamp?: number | string | null): string {
   if (!timestamp) return 'unknown';
@@ -243,19 +243,27 @@ export function conversationToMarkdown(
   const toMd = (m: ChatGPTMessage) => messageToMarkdown(m, fmap, filesRel);
 
   if (options.includeAllBranches) {
-    const branches = getAllBranches(conversation);
-    if (branches.length <= 1) {
+    const split = splitBranchesBySharedPrefix(conversation);
+    if (!split) {
       const path = getActivePath(conversation);
       const body = path.messages.map(toMd).filter(Boolean).join('\n');
       return frontmatter + `# ${title}\n\n${body}`;
     }
 
-    const sections = branches.map((branch, i) => {
+    const shared = split.shared.map(toMd).filter(Boolean).join('\n');
+    const sharedSection = shared ? `## Shared history\n\n${shared}\n\n` : '';
+
+    const sections = split.branches.map((branch, i) => {
       const body = branch.messages.map(toMd).filter(Boolean).join('\n');
-      return `## Branch ${i + 1}\n\n${body}`;
+      const label = branch.isActive ? `## Branch ${i + 1} (active)` : `## Branch ${i + 1}`;
+      return `${label}\n\n${body}`;
     });
 
-    return frontmatter + `# ${title}\n\n_${branches.length} branches preserved_\n\n${sections.join('\n\n---\n\n')}`;
+    return (
+      frontmatter +
+      `# ${title}\n\n_${split.count} branches preserved (shared history shown once)_\n\n` +
+      `${sharedSection}${sections.join('\n\n---\n\n')}`
+    );
   }
 
   const path = getActivePath(conversation);
@@ -378,25 +386,30 @@ export function toContextBlock(
     let body: string;
 
     if (includeAllBranches) {
-      const branches = getAllBranches(conv);
-      if (branches.length <= 1) {
+      const split = splitBranchesBySharedPrefix(conv);
+      if (!split) {
         body = chatBranch
           ? formatChatBranch(getActivePath(conv).messages)
           : formatMessages(getActivePath(conv).messages);
       } else {
-        body = branches
+        const branchBlocks = split.branches
           .map((branch, i) => {
             const messages = formatMessages(branch.messages);
             if (!messages) return '';
-            const active =
-              conv.current_node &&
-              branch.nodeIds[branch.nodeIds.length - 1] === conv.current_node;
-            const blabel = active ? `#### Branch ${i + 1} (active)` : `#### Branch ${i + 1}`;
+            const blabel = branch.isActive
+              ? `#### Branch ${i + 1} (active)`
+              : `#### Branch ${i + 1}`;
             return `${blabel}\n${messages}`;
           })
           .filter(Boolean)
           .join('\n\n');
-        body = `_${branches.length} regenerated branches preserved_\n\n${body}`;
+        const sharedBlock = formatMessages(split.shared);
+        const parts = [
+          `_${split.count} regenerated branches preserved (shared history shown once)_`,
+        ];
+        if (sharedBlock) parts.push(`#### Shared history\n${sharedBlock}`);
+        parts.push(branchBlocks);
+        body = parts.join('\n\n');
       }
     } else if (chatBranch) {
       body = formatChatBranch(getActivePath(conv).messages);

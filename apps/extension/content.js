@@ -189,6 +189,31 @@
   function countBranches(conversation) {
     return getAllBranches(conversation).length;
   }
+  function splitBranchesBySharedPrefix(conversation) {
+    const branches = getAllBranches(conversation);
+    if (branches.length <= 1) return null;
+    const mapping = conversation.mapping ?? {};
+    const idLists = branches.map((b) => b.nodeIds);
+    const minLen = Math.min(...idLists.map((l) => l.length));
+    let prefixLen = 0;
+    while (prefixLen < minLen && idLists.every((l) => l[prefixLen] === idLists[0][prefixLen])) {
+      prefixLen++;
+    }
+    if (prefixLen >= minLen) prefixLen = minLen - 1;
+    const toMessages = (ids) => ids.map((id) => mapping[id]?.message).filter((m) => Boolean(m?.content));
+    const activeLeaf = conversation.current_node;
+    return {
+      shared: toMessages(idLists[0].slice(0, prefixLen)),
+      branches: branches.map((b) => ({
+        nodeIds: b.nodeIds,
+        messages: toMessages(b.nodeIds.slice(prefixLen)),
+        isActive: Boolean(
+          activeLeaf && b.nodeIds[b.nodeIds.length - 1] === activeLeaf
+        )
+      })),
+      count: branches.length
+    };
+  }
   function findDefaultLeaf(mapping) {
     const leaves = getLeafNodeIds(mapping);
     return leaves[0] ?? Object.keys(mapping)[0] ?? "";
@@ -361,25 +386,32 @@ ${text}
     const filesRel = options.filesRelPath ?? "../files";
     const toMd = (m) => messageToMarkdown(m, fmap, filesRel);
     if (options.includeAllBranches) {
-      const branches = getAllBranches(conversation);
-      if (branches.length <= 1) {
+      const split = splitBranchesBySharedPrefix(conversation);
+      if (!split) {
         const path2 = getActivePath(conversation);
         const body2 = path2.messages.map(toMd).filter(Boolean).join("\n");
         return frontmatter + `# ${title}
 
 ${body2}`;
       }
-      const sections = branches.map((branch, i) => {
+      const shared = split.shared.map(toMd).filter(Boolean).join("\n");
+      const sharedSection = shared ? `## Shared history
+
+${shared}
+
+` : "";
+      const sections = split.branches.map((branch, i) => {
         const body2 = branch.messages.map(toMd).filter(Boolean).join("\n");
-        return `## Branch ${i + 1}
+        const label = branch.isActive ? `## Branch ${i + 1} (active)` : `## Branch ${i + 1}`;
+        return `${label}
 
 ${body2}`;
       });
       return frontmatter + `# ${title}
 
-_${branches.length} branches preserved_
+_${split.count} branches preserved (shared history shown once)_
 
-${sections.join("\n\n---\n\n")}`;
+${sharedSection}${sections.join("\n\n---\n\n")}`;
     }
     const path = getActivePath(conversation);
     const body = path.messages.map(toMd).filter(Boolean).join("\n");
@@ -458,21 +490,25 @@ ${body}`;
 `;
       let body;
       if (includeAllBranches) {
-        const branches = getAllBranches(conv);
-        if (branches.length <= 1) {
+        const split = splitBranchesBySharedPrefix(conv);
+        if (!split) {
           body = chatBranch ? formatChatBranch(getActivePath(conv).messages) : formatMessages(getActivePath(conv).messages);
         } else {
-          body = branches.map((branch, i) => {
+          const branchBlocks = split.branches.map((branch, i) => {
             const messages = formatMessages(branch.messages);
             if (!messages) return "";
-            const active = conv.current_node && branch.nodeIds[branch.nodeIds.length - 1] === conv.current_node;
-            const blabel = active ? `#### Branch ${i + 1} (active)` : `#### Branch ${i + 1}`;
+            const blabel = branch.isActive ? `#### Branch ${i + 1} (active)` : `#### Branch ${i + 1}`;
             return `${blabel}
 ${messages}`;
           }).filter(Boolean).join("\n\n");
-          body = `_${branches.length} regenerated branches preserved_
-
-${body}`;
+          const sharedBlock = formatMessages(split.shared);
+          const parts = [
+            `_${split.count} regenerated branches preserved (shared history shown once)_`
+          ];
+          if (sharedBlock) parts.push(`#### Shared history
+${sharedBlock}`);
+          parts.push(branchBlocks);
+          body = parts.join("\n\n");
         }
       } else if (chatBranch) {
         body = formatChatBranch(getActivePath(conv).messages);
@@ -887,12 +923,58 @@ ${ci.about_model}
     return { files, indexMarkdown, entries };
   }
   async function exportSingleConversation(session, conversationId, options = {}) {
-    return exportAllConversations(session, {
-      ...options,
-      conversationIds: [conversationId],
-      includeArchived: false,
-      includeProjects: false
-    });
+    const { downloadFiles = true, downloadImages = true, onProgress } = options;
+    const emit = (event) => onProgress?.(event);
+    emit({ phase: "downloading", message: "Downloading conversation\u2026", total: 1, current: 0 });
+    const conv = await fetchConversation(session, conversationId);
+    const files = /* @__PURE__ */ new Map();
+    const fileMeta = /* @__PURE__ */ new Map();
+    if (downloadFiles) {
+      const throttle = new Throttle(800);
+      const refs = extractFileReferences(conv).filter(
+        (ref) => ref.type === "image" ? downloadImages : true
+      );
+      for (const ref of refs) {
+        if (files.has(ref.fileId)) continue;
+        await throttle.wait();
+        try {
+          const downloaded = await downloadFile(session, ref);
+          if (downloaded) {
+            files.set(ref.fileId, downloaded.data);
+            fileMeta.set(ref.fileId, {
+              contentType: downloaded.contentType,
+              fileName: downloaded.fileName
+            });
+          }
+        } catch {
+        }
+      }
+    }
+    emit({ phase: "complete", message: "Export complete", current: 1, total: 1, conversationId });
+    const id = conv.conversation_id ?? conv.id ?? conversationId;
+    const index = [
+      {
+        id,
+        title: conv.title,
+        create_time: conv.create_time,
+        update_time: conv.update_time,
+        gizmo_id: conv.gizmo_id,
+        _archived: conv.is_archived === true ? true : void 0
+      }
+    ];
+    return {
+      conversations: [conv],
+      files,
+      fileMeta,
+      index,
+      stats: {
+        conversationCount: 1,
+        fileCount: files.size,
+        branchCount: countBranches(conv),
+        archivedCount: conv.is_archived === true ? 1 : 0,
+        projectCount: conv.gizmo_id ? 1 : 0
+      }
+    };
   }
 
   // node_modules/fflate/esm/browser.js

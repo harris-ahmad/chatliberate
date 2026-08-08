@@ -55,6 +55,14 @@ test('toContextBlock includeAllBranches preserves every regenerated reply', () =
   assert.match(block, /Response B/);
 });
 
+test('toContextBlock renders shared history once, not per branch', () => {
+  const block = toContextBlock([branchedConversation], { includeAllBranches: true });
+  // "Hello" is the shared user turn before the fork — must appear exactly once
+  const helloCount = (block.match(/Hello/g) || []).length;
+  assert.equal(helloCount, 1);
+  assert.match(block, /#### Shared history/);
+});
+
 test('toContextBlock splits ChatGPT “Branch in new chat” linear forks', () => {
   const linearFork = {
     title: 'Branch · SEO for React Apps',

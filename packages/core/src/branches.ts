@@ -156,6 +156,64 @@ export function countBranches(conversation: Conversation): number {
   return getAllBranches(conversation).length;
 }
 
+export interface SharedBranchView {
+  /** Messages common to every branch, in order — render these once. */
+  shared: ChatGPTMessage[];
+  /** Each branch's divergent tail (messages after the shared prefix). */
+  branches: Array<{
+    nodeIds: string[];
+    messages: ChatGPTMessage[];
+    isActive: boolean;
+  }>;
+  count: number;
+}
+
+/**
+ * Split the branch set into the history they all share plus each branch's
+ * divergent tail. ChatGPT regenerations fork late, so every branch otherwise
+ * repeats the entire conversation — this lets callers print the shared prefix
+ * once instead of N times. Returns null for linear chats (0 or 1 branch).
+ */
+export function splitBranchesBySharedPrefix(
+  conversation: Conversation,
+): SharedBranchView | null {
+  const branches = getAllBranches(conversation);
+  if (branches.length <= 1) return null;
+
+  const mapping = conversation.mapping ?? {};
+  const idLists = branches.map((b) => b.nodeIds);
+  const minLen = Math.min(...idLists.map((l) => l.length));
+
+  let prefixLen = 0;
+  while (
+    prefixLen < minLen &&
+    idLists.every((l) => l[prefixLen] === idLists[0][prefixLen])
+  ) {
+    prefixLen++;
+  }
+  // Never let the shared prefix swallow a branch whole — keep at least its leaf.
+  if (prefixLen >= minLen) prefixLen = minLen - 1;
+
+  const toMessages = (ids: string[]): ChatGPTMessage[] =>
+    ids
+      .map((id) => mapping[id]?.message)
+      .filter((m): m is ChatGPTMessage => Boolean(m?.content));
+
+  const activeLeaf = conversation.current_node;
+
+  return {
+    shared: toMessages(idLists[0].slice(0, prefixLen)),
+    branches: branches.map((b) => ({
+      nodeIds: b.nodeIds,
+      messages: toMessages(b.nodeIds.slice(prefixLen)),
+      isActive: Boolean(
+        activeLeaf && b.nodeIds[b.nodeIds.length - 1] === activeLeaf,
+      ),
+    })),
+    count: branches.length,
+  };
+}
+
 export function findDefaultLeaf(mapping: Record<string, MessageNode>): string {
   const leaves = getLeafNodeIds(mapping);
   return leaves[0] ?? Object.keys(mapping)[0] ?? '';
