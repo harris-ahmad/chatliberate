@@ -435,6 +435,13 @@ ${body}`;
     if (current) chunks.push(current);
     return chunks;
   }
+  function keepTail(text, budget) {
+    if (text.length <= budget) return text;
+    let tail = text.slice(text.length - budget);
+    const nl = tail.indexOf("\n");
+    if (nl !== -1) tail = tail.slice(nl + 1);
+    return tail.trimStart();
+  }
   function toContextBlock(conversations, opts = {}) {
     const {
       maxChars = 6e4,
@@ -501,12 +508,19 @@ ${body}`;
             return `${blabel}
 ${messages}`;
           }).filter(Boolean).join("\n\n");
-          const sharedBlock = formatMessages(split.shared);
+          let sharedSection = "";
+          if (chatBranch) {
+            const forked = formatChatBranch(split.shared);
+            if (forked) sharedSection = forked;
+          } else {
+            const sharedBlock = formatMessages(split.shared);
+            if (sharedBlock) sharedSection = `#### Shared history
+${sharedBlock}`;
+          }
           const parts = [
             `_${split.count} regenerated branches preserved (shared history shown once)_`
           ];
-          if (sharedBlock) parts.push(`#### Shared history
-${sharedBlock}`);
+          if (sharedSection) parts.push(sharedSection);
           parts.push(branchBlocks);
           body = parts.join("\n\n");
         }
@@ -516,7 +530,18 @@ ${sharedBlock}`);
         body = formatMessages(getActivePath(conv).messages);
       }
       const entry = header + body + "\n\n";
-      if (entry.length > remaining) break;
+      if (entry.length > remaining) {
+        const marker = `_[Older messages truncated to fit the ${maxChars.toLocaleString()}-character limit \u2014 export the full chat for the complete history.]_
+
+`;
+        const budget = remaining - header.length - marker.length - 4;
+        if (budget > 500) {
+          lines.push(`${header}${marker}${keepTail(body, budget)}
+
+`);
+        }
+        break;
+      }
       lines.push(entry);
       remaining -= entry.length;
     }

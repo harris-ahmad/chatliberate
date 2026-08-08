@@ -298,6 +298,15 @@ export function chunkMarkdown(
   return chunks;
 }
 
+/** Keep the last `budget` chars of `text`, trimmed to a clean line boundary. */
+function keepTail(text: string, budget: number): string {
+  if (text.length <= budget) return text;
+  let tail = text.slice(text.length - budget);
+  const nl = tail.indexOf('\n');
+  if (nl !== -1) tail = tail.slice(nl + 1);
+  return tail.trimStart();
+}
+
 /**
  * Produce a compact context block suitable for pasting at the top of a new
  * Claude/Gemini/ChatGPT conversation to seed it with history.
@@ -403,11 +412,20 @@ export function toContextBlock(
           })
           .filter(Boolean)
           .join('\n\n');
-        const sharedBlock = formatMessages(split.shared);
+        // The "Branch in new chat" divider lives in the linear shared history,
+        // so apply its split there rather than dropping it when regen branches exist.
+        let sharedSection = '';
+        if (chatBranch) {
+          const forked = formatChatBranch(split.shared);
+          if (forked) sharedSection = forked;
+        } else {
+          const sharedBlock = formatMessages(split.shared);
+          if (sharedBlock) sharedSection = `#### Shared history\n${sharedBlock}`;
+        }
         const parts = [
           `_${split.count} regenerated branches preserved (shared history shown once)_`,
         ];
-        if (sharedBlock) parts.push(`#### Shared history\n${sharedBlock}`);
+        if (sharedSection) parts.push(sharedSection);
         parts.push(branchBlocks);
         body = parts.join('\n\n');
       }
@@ -418,7 +436,17 @@ export function toContextBlock(
     }
 
     const entry = header + body + '\n\n';
-    if (entry.length > remaining) break;
+    if (entry.length > remaining) {
+      // Don't drop the whole conversation — keep its most recent turns (the
+      // part you're continuing from) with a marker, then stop. Only bother if
+      // there's enough room left for a meaningful slice.
+      const marker = `_[Older messages truncated to fit the ${maxChars.toLocaleString()}-character limit — export the full chat for the complete history.]_\n\n`;
+      const budget = remaining - header.length - marker.length - 4;
+      if (budget > 500) {
+        lines.push(`${header}${marker}${keepTail(body, budget)}\n\n`);
+      }
+      break;
+    }
     lines.push(entry);
     remaining -= entry.length;
   }
