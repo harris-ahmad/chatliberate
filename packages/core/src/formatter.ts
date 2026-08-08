@@ -294,6 +294,12 @@ export function chunkMarkdown(
  * Produce a compact context block suitable for pasting at the top of a new
  * Claude/Gemini/ChatGPT conversation to seed it with history.
  * Strips frontmatter and collapses whitespace.
+ *
+ * By default only the active branch is included (best for context limits).
+ * Pass includeAllBranches: true to preserve every regenerated reply path.
+ *
+ * chatBranch handles ChatGPT's "Branch in new chat" UI (linear API path with a
+ * "Branched from …" divider): splits shared history vs this fork's new turns.
  */
 export function toContextBlock(
   conversations: Conversation[],
@@ -301,27 +307,28 @@ export function toContextBlock(
     maxChars?: number;
     label?: string;
     fileExtMap?: Map<string, string>;
+    includeAllBranches?: boolean;
+    /** "Branch in new chat" marker from the page UI */
+    chatBranch?: { label: string; firstUserText?: string };
   } = {},
 ): string {
-  const { maxChars = 60_000, label = 'Previous conversation history', fileExtMap = new Map() } = opts;
+  const {
+    maxChars = 60_000,
+    label = 'Previous conversation history',
+    fileExtMap = new Map(),
+    includeAllBranches = false,
+    chatBranch,
+  } = opts;
 
   const imageFileIds: string[] = [];
   const imgPattern = /!\[image\]\(\.\.\/files\/([^)]+)\)/g;
 
-  const lines: string[] = [`<${label}>`, ''];
-
-  let remaining = maxChars - label.length - 50;
-
-  for (const conv of conversations) {
-    const path = getActivePath(conv);
-    const title = conv.title ?? 'Untitled';
-    const header = `### ${title}\n`;
-    const body = path.messages
+  const formatMessages = (messages: ChatGPTMessage[]) =>
+    messages
       .map((m) => {
         const role = m.author?.role === 'user' ? 'User' : 'Assistant';
         let text = extractMessageText(m, fileExtMap).trim();
         if (!text) return '';
-        // Collect image references and replace with placeholder
         let match: RegExpExecArray | null;
         imgPattern.lastIndex = 0;
         while ((match = imgPattern.exec(text)) !== null) {
@@ -332,6 +339,70 @@ export function toContextBlock(
       })
       .filter(Boolean)
       .join('\n');
+
+  /** Split a linear path at the first user turn matching the branched-from UI */
+  const formatChatBranch = (messages: ChatGPTMessage[]) => {
+    const needle = (chatBranch?.firstUserText || '').trim();
+    let splitAt = -1;
+    if (needle) {
+      const norm = needle.replace(/\s+/g, ' ').slice(0, 120).toLowerCase();
+      splitAt = messages.findIndex((m) => {
+        if (m.author?.role !== 'user') return false;
+        const text = extractMessageText(m, fileExtMap).replace(/\s+/g, ' ').trim().toLowerCase();
+        return text.startsWith(norm) || norm.startsWith(text.slice(0, 80));
+      });
+    }
+    if (splitAt <= 0) {
+      return formatMessages(messages);
+    }
+    const shared = formatMessages(messages.slice(0, splitAt));
+    const branched = formatMessages(messages.slice(splitAt));
+    const from = chatBranch?.label || 'Branched chat';
+    return [
+      '#### Shared history (before branch)',
+      shared,
+      '',
+      `#### ${from}`,
+      branched,
+    ]
+      .filter((line, i, arr) => !(line === '' && arr[i - 1] === ''))
+      .join('\n');
+  };
+
+  const lines: string[] = [`<${label}>`, ''];
+  let remaining = maxChars - label.length - 50;
+
+  for (const conv of conversations) {
+    const title = conv.title ?? 'Untitled';
+    const header = `### ${title}\n`;
+    let body: string;
+
+    if (includeAllBranches) {
+      const branches = getAllBranches(conv);
+      if (branches.length <= 1) {
+        body = chatBranch
+          ? formatChatBranch(getActivePath(conv).messages)
+          : formatMessages(getActivePath(conv).messages);
+      } else {
+        body = branches
+          .map((branch, i) => {
+            const messages = formatMessages(branch.messages);
+            if (!messages) return '';
+            const active =
+              conv.current_node &&
+              branch.nodeIds[branch.nodeIds.length - 1] === conv.current_node;
+            const blabel = active ? `#### Branch ${i + 1} (active)` : `#### Branch ${i + 1}`;
+            return `${blabel}\n${messages}`;
+          })
+          .filter(Boolean)
+          .join('\n\n');
+        body = `_${branches.length} regenerated branches preserved_\n\n${body}`;
+      }
+    } else if (chatBranch) {
+      body = formatChatBranch(getActivePath(conv).messages);
+    } else {
+      body = formatMessages(getActivePath(conv).messages);
+    }
 
     const entry = header + body + '\n\n';
     if (entry.length > remaining) break;

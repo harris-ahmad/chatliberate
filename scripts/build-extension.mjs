@@ -1,11 +1,14 @@
 import * as esbuild from 'esbuild';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, '..');
 const extDir = join(root, 'apps/extension');
+const iconsDir = join(extDir, 'icons');
+const svgPath = join(iconsDir, 'icon.svg');
 
 await esbuild.build({
   entryPoints: [join(extDir, 'src/content.js')],
@@ -17,25 +20,44 @@ await esbuild.build({
   minify: false,
 });
 
-// Simple SVG icons
-const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-  <rect width="128" height="128" rx="24" fill="#10a37f"/>
-  <path d="M32 44h64v8H32zm0 20h48v8H32zm0 20h56v8H32z" fill="white"/>
-  <path d="M88 76l12 12-12 12v-8H72v-8h16z" fill="white" opacity="0.9"/>
-</svg>`;
+mkdirSync(iconsDir, { recursive: true });
 
-mkdirSync(join(extDir, 'icons'), { recursive: true });
-
-// Write placeholder PNG note - extension needs actual PNGs
-// For dev, create minimal 1x1 PNGs or use SVG converted
-for (const size of [16, 48, 128]) {
-  // Minimal valid PNG (green square) - base64 decoded
-  const png = Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-    'base64',
-  );
-  writeFileSync(join(extDir, 'icons', `icon${size}.png`), png);
+if (!existsSync(svgPath)) {
+  throw new Error(`Missing ${svgPath} — add the ChatLiberate icon.svg before building`);
 }
 
-writeFileSync(join(extDir, 'icons', 'icon.svg'), iconSvg);
-console.log('Extension bundled → apps/extension/content.js');
+function pngLooksValid(filePath) {
+  if (!existsSync(filePath)) return false;
+  // The old build wrote a 70-byte 1×1 stub — treat tiny files as corrupt
+  return statSync(filePath).size > 100;
+}
+
+function rasterizeWithRsvg(size, outPath) {
+  const result = spawnSync(
+    'rsvg-convert',
+    ['-w', String(size), '-h', String(size), svgPath, '-o', outPath],
+    { encoding: 'utf8' },
+  );
+  return result.status === 0 && pngLooksValid(outPath);
+}
+
+let rasterized = 0;
+for (const size of [16, 48, 128]) {
+  const outPath = join(iconsDir, `icon${size}.png`);
+  if (rasterizeWithRsvg(size, outPath)) {
+    rasterized++;
+    continue;
+  }
+  if (pngLooksValid(outPath)) {
+    console.warn(`rsvg-convert unavailable — keeping existing icon${size}.png`);
+    continue;
+  }
+  throw new Error(
+    `Could not build icons/icon${size}.png. Install librsvg (brew install librsvg) or restore the PNG from git.`,
+  );
+}
+
+console.log(
+  `Extension bundled → apps/extension/content.js` +
+    (rasterized ? ` (icons regenerated from icon.svg)` : ''),
+);

@@ -10,12 +10,72 @@ import {
   toOpenAIExportFormat,
   toContextBlock,
   chunkMarkdown,
+  countBranches,
 } from '@chatliberate/core';
 import { zipSync, strToU8 } from 'fflate';
 
 function getCurrentConversationId() {
   const match = window.location.pathname.match(/\/c\/([a-f0-9-]+)/i);
   return match?.[1];
+}
+
+/**
+ * ChatGPT's "Branch in new chat" shows a divider like
+ * "Branched from Branch · SEO for React Apps". That fork is usually ONE
+ * linear path in the API — detect the divider in the DOM so we can split
+ * shared history vs this branch's new turns when copying.
+ */
+function detectChatBranchFromDom() {
+  const candidates = Array.from(document.querySelectorAll('a, button, span, div'));
+  const divider = candidates.find((el) => {
+    const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    return /^Branched from\b/i.test(text) && text.length < 160;
+  });
+  if (!divider) return null;
+
+  const label = (divider.textContent || '').replace(/\s+/g, ' ').trim();
+
+  // First user bubble after the divider in document order
+  const all = Array.from(document.querySelectorAll('div[data-message-author-role], [data-message-author-role]'));
+  let passedDivider = false;
+  let firstUserText = '';
+  for (const el of all) {
+    if (divider === el || divider.contains(el) || el.contains(divider)) {
+      passedDivider = true;
+      continue;
+    }
+    // Compare document position
+    const pos = divider.compareDocumentPosition(el);
+    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) {
+      passedDivider = true;
+    }
+    if (!passedDivider && !(pos & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+    const role = el.getAttribute('data-message-author-role');
+    if (role === 'user') {
+      firstUserText = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (firstUserText) break;
+    }
+  }
+
+  // Fallback: walk next siblings from divider's block
+  if (!firstUserText) {
+    let node = divider.parentElement;
+    for (let depth = 0; depth < 6 && node; depth++, node = node.parentElement) {
+      let sib = node.nextElementSibling;
+      while (sib) {
+        const user = sib.querySelector?.('[data-message-author-role="user"]') ||
+          (sib.getAttribute?.('data-message-author-role') === 'user' ? sib : null);
+        if (user) {
+          firstUserText = (user.innerText || user.textContent || '').replace(/\s+/g, ' ').trim();
+          if (firstUserText) break;
+        }
+        sib = sib.nextElementSibling;
+      }
+      if (firstUserText) break;
+    }
+  }
+
+  return { label, firstUserText: firstUserText || undefined };
 }
 
 function downloadBlob(filename, blob) {
@@ -87,7 +147,11 @@ async function buildZip(result, extras = {}) {
   }
 
   // 6. Import-ready context block for Claude/Gemini
-  const contextBlock = toContextBlock(result.conversations, { maxChars: 60_000, fileExtMap });
+  const contextBlock = toContextBlock(result.conversations, {
+    maxChars: 60_000,
+    fileExtMap,
+    includeAllBranches: Boolean(extras.includeBranches),
+  });
   files['import-context-for-claude-gemini.md'] = contextBlock;
 
   // 7. Stats
@@ -175,7 +239,11 @@ async function runExport(mode, options) {
     });
   }
 
-  const zip = await buildZip(result, { memories, customInstructions });
+  const zip = await buildZip(result, {
+    memories,
+    customInstructions,
+    includeBranches: options.includeBranches,
+  });
   const date = new Date().toISOString().slice(0, 10);
   downloadBlob(`chatliberate-export-${date}.zip`, zip);
 
@@ -199,16 +267,35 @@ async function copyContextForCurrent(options) {
     if (ext) fileExtMap.set(fileId, ext);
   }
 
+  const chatBranch = detectChatBranchFromDom();
+
   const context = toContextBlock(result.conversations, {
     maxChars: 120_000,
     fileExtMap,
+    includeAllBranches: Boolean(options?.includeBranches),
+    chatBranch: chatBranch || undefined,
   });
 
   // Count unique images referenced in the conversation
   const imgPattern = /\[image attached separately\]/g;
   const imageCount = (context.match(imgPattern) || []).length;
+  const branchCount = result.conversations.reduce(
+    (n, c) => n + (options?.includeBranches ? countBranches(c) : 1),
+    0,
+  );
+  const dagBranches = options?.includeBranches && context.includes('regenerated branches preserved');
+  const chatFork = Boolean(chatBranch) && context.includes('Shared history (before branch)');
 
-  return { ok: true, context, imageCount };
+  return {
+    ok: true,
+    context,
+    imageCount,
+    includeAllBranches: Boolean(options?.includeBranches),
+    branchNote: dagBranches || chatFork,
+    branchCount: dagBranches ? branchCount : chatFork ? 2 : branchCount,
+    chatFork,
+    chatBranchLabel: chatBranch?.label,
+  };
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
