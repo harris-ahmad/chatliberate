@@ -36,7 +36,7 @@ async function init() {
   if (stored.exportProgress?.downloadedIds?.length) {
     const count = stored.exportProgress.downloadedIds.length;
     clearResumeBtn.classList.remove('hidden');
-    clearResumeBtn.textContent = `Resume from ${count} already downloaded — or clear`;
+    clearResumeBtn.textContent = `Clear saved progress from last export (${count} chats)`;
   }
 }
 

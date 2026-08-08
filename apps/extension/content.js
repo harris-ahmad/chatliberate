@@ -1823,7 +1823,7 @@ ${ci.about_model}
         exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
         ...result.stats,
         tool: "chatliberate",
-        version: "0.1.2",
+        version: chrome.runtime.getManifest().version,
         accountType: document.cookie.includes("_account=") ? "teams/business" : "personal",
         memoriesCount: extras.memories?.length ?? 0,
         hasCustomInstructions: Boolean(extras.customInstructions?.about_user || extras.customInstructions?.about_model),
