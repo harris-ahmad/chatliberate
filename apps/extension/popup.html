@@ -26,13 +26,14 @@
     <label><input type="checkbox" id="includeProjects" checked /> Project chats</label>
     <label><input type="checkbox" id="downloadImages" checked /> Download images</label>
     <label><input type="checkbox" id="includeBranches" checked /> All regenerated branches</label>
+    <p class="hint">Also applies to ⎘ Copy — unchecked = active path only</p>
   </section>
 
   <button id="exportAll" class="primary" disabled>Export All Conversations</button>
 
   <div class="row">
     <button id="exportCurrent" class="secondary" disabled>Export Current Chat</button>
-    <button id="copyContext" class="secondary icon" disabled title="Copy current chat as context for Claude/Gemini">⎘ Copy</button>
+    <button id="copyContext" class="secondary icon" disabled title="Copy current chat for Claude/Gemini. Respects ‘All regenerated branches’ above.">⎘ Copy</button>
   </div>
 
   <button id="exportPdf" class="ghost" disabled>Print current chat as PDF</button>

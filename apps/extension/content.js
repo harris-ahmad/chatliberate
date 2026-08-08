@@ -90,19 +90,65 @@
       this.ms = Math.min(this.ms + 2e3, 12e4);
     }
   };
+  function buildEffectiveChildren(mapping) {
+    const children = /* @__PURE__ */ new Map();
+    const add = (parentId, childId) => {
+      if (!mapping[parentId] || !mapping[childId]) return;
+      let set = children.get(parentId);
+      if (!set) {
+        set = /* @__PURE__ */ new Set();
+        children.set(parentId, set);
+      }
+      set.add(childId);
+    };
+    for (const [id, node] of Object.entries(mapping)) {
+      for (const childId of node.children ?? []) {
+        add(id, childId);
+      }
+      if (node.parent) {
+        add(node.parent, id);
+      }
+    }
+    return new Map(
+      [...children.entries()].map(([id, set]) => [id, [...set]])
+    );
+  }
+  function effectiveChildren(tree, nodeId) {
+    return tree.get(nodeId) ?? [];
+  }
   function getLeafNodeIds(mapping) {
-    return Object.entries(mapping).filter(([, node]) => !node.children || node.children.length === 0).map(([id]) => id);
+    const tree = buildEffectiveChildren(mapping);
+    return Object.keys(mapping).filter(
+      (id) => effectiveChildren(tree, id).length === 0
+    );
   }
   function pathToRoot(mapping, leafId) {
     const path = [];
     let current = leafId;
+    const guard = /* @__PURE__ */ new Set();
     while (current) {
+      if (guard.has(current)) break;
+      guard.add(current);
       path.push(current);
       const node = mapping[current];
       if (!node?.parent) break;
       current = node.parent;
     }
     return path.reverse();
+  }
+  function pathHasVisibleMessages(mapping, nodeIds) {
+    return nodeIds.some((id) => {
+      const role = mapping[id]?.message?.author?.role;
+      return role === "user" || role === "assistant";
+    });
+  }
+  function keepMaximalPaths(branches) {
+    return branches.filter((branch) => {
+      const key = branch.nodeIds.join(">");
+      return !branches.some(
+        (other) => other !== branch && other.nodeIds.length > branch.nodeIds.length && other.nodeIds.join(">").startsWith(`${key}>`)
+      );
+    });
   }
   function getActivePath(conversation) {
     const mapping = conversation.mapping ?? {};
@@ -120,6 +166,7 @@
     const branches = [];
     for (const leafId of leaves) {
       const nodeIds = pathToRoot(mapping, leafId);
+      if (!pathHasVisibleMessages(mapping, nodeIds)) continue;
       const key = nodeIds.join(">");
       if (seen.has(key)) continue;
       seen.add(key);
@@ -128,10 +175,44 @@
         messages: nodeIds.map((id) => mapping[id]?.message).filter((m) => Boolean(m?.content))
       });
     }
-    return branches;
+    const maximal = keepMaximalPaths(branches);
+    const activeLeaf = conversation.current_node;
+    if (activeLeaf) {
+      maximal.sort((a, b) => {
+        const aIsLeaf = a.nodeIds[a.nodeIds.length - 1] === activeLeaf ? 0 : 1;
+        const bIsLeaf = b.nodeIds[b.nodeIds.length - 1] === activeLeaf ? 0 : 1;
+        return aIsLeaf - bIsLeaf;
+      });
+    }
+    return maximal;
   }
   function countBranches(conversation) {
     return getAllBranches(conversation).length;
+  }
+  function splitBranchesBySharedPrefix(conversation) {
+    const branches = getAllBranches(conversation);
+    if (branches.length <= 1) return null;
+    const mapping = conversation.mapping ?? {};
+    const idLists = branches.map((b) => b.nodeIds);
+    const minLen = Math.min(...idLists.map((l) => l.length));
+    let prefixLen = 0;
+    while (prefixLen < minLen && idLists.every((l) => l[prefixLen] === idLists[0][prefixLen])) {
+      prefixLen++;
+    }
+    if (prefixLen >= minLen) prefixLen = minLen - 1;
+    const toMessages = (ids) => ids.map((id) => mapping[id]?.message).filter((m) => Boolean(m?.content));
+    const activeLeaf = conversation.current_node;
+    return {
+      shared: toMessages(idLists[0].slice(0, prefixLen)),
+      branches: branches.map((b) => ({
+        nodeIds: b.nodeIds,
+        messages: toMessages(b.nodeIds.slice(prefixLen)),
+        isActive: Boolean(
+          activeLeaf && b.nodeIds[b.nodeIds.length - 1] === activeLeaf
+        )
+      })),
+      count: branches.length
+    };
   }
   function findDefaultLeaf(mapping) {
     const leaves = getLeafNodeIds(mapping);
@@ -305,25 +386,32 @@ ${text}
     const filesRel = options.filesRelPath ?? "../files";
     const toMd = (m) => messageToMarkdown(m, fmap, filesRel);
     if (options.includeAllBranches) {
-      const branches = getAllBranches(conversation);
-      if (branches.length <= 1) {
+      const split = splitBranchesBySharedPrefix(conversation);
+      if (!split) {
         const path2 = getActivePath(conversation);
         const body2 = path2.messages.map(toMd).filter(Boolean).join("\n");
         return frontmatter + `# ${title}
 
 ${body2}`;
       }
-      const sections = branches.map((branch, i) => {
+      const shared = split.shared.map(toMd).filter(Boolean).join("\n");
+      const sharedSection = shared ? `## Shared history
+
+${shared}
+
+` : "";
+      const sections = split.branches.map((branch, i) => {
         const body2 = branch.messages.map(toMd).filter(Boolean).join("\n");
-        return `## Branch ${i + 1}
+        const label = branch.isActive ? `## Branch ${i + 1} (active)` : `## Branch ${i + 1}`;
+        return `${label}
 
 ${body2}`;
       });
       return frontmatter + `# ${title}
 
-_${branches.length} branches preserved_
+_${split.count} branches preserved (shared history shown once)_
 
-${sections.join("\n\n---\n\n")}`;
+${sharedSection}${sections.join("\n\n---\n\n")}`;
     }
     const path = getActivePath(conversation);
     const body = path.messages.map(toMd).filter(Boolean).join("\n");
@@ -347,31 +435,113 @@ ${body}`;
     if (current) chunks.push(current);
     return chunks;
   }
+  function keepTail(text, budget) {
+    if (text.length <= budget) return text;
+    let tail = text.slice(text.length - budget);
+    const nl = tail.indexOf("\n");
+    if (nl !== -1) tail = tail.slice(nl + 1);
+    return tail.trimStart();
+  }
   function toContextBlock(conversations, opts = {}) {
-    const { maxChars = 6e4, label = "Previous conversation history", fileExtMap = /* @__PURE__ */ new Map() } = opts;
+    const {
+      maxChars = 6e4,
+      label = "Previous conversation history",
+      fileExtMap = /* @__PURE__ */ new Map(),
+      includeAllBranches = false,
+      chatBranch
+    } = opts;
     const imageFileIds = [];
     const imgPattern = /!\[image\]\(\.\.\/files\/([^)]+)\)/g;
+    const formatMessages = (messages) => messages.map((m) => {
+      const role = m.author?.role === "user" ? "User" : "Assistant";
+      let text = extractMessageText(m, fileExtMap).trim();
+      if (!text) return "";
+      let match;
+      imgPattern.lastIndex = 0;
+      while ((match = imgPattern.exec(text)) !== null) {
+        imageFileIds.push(match[1]);
+      }
+      text = text.replace(imgPattern, "[image attached separately]");
+      return `${role}: ${text}`;
+    }).filter(Boolean).join("\n");
+    const formatChatBranch = (messages) => {
+      const needle = (chatBranch?.firstUserText || "").trim();
+      let splitAt = -1;
+      if (needle) {
+        const norm = needle.replace(/\s+/g, " ").slice(0, 120).toLowerCase();
+        splitAt = messages.findIndex((m) => {
+          if (m.author?.role !== "user") return false;
+          const text = extractMessageText(m, fileExtMap).replace(/\s+/g, " ").trim().toLowerCase();
+          return text.startsWith(norm) || norm.startsWith(text.slice(0, 80));
+        });
+      }
+      if (splitAt <= 0) {
+        return formatMessages(messages);
+      }
+      const shared = formatMessages(messages.slice(0, splitAt));
+      const branched = formatMessages(messages.slice(splitAt));
+      const from = chatBranch?.label || "Branched chat";
+      return [
+        "#### Shared history (before branch)",
+        shared,
+        "",
+        `#### ${from}`,
+        branched
+      ].filter((line, i, arr) => !(line === "" && arr[i - 1] === "")).join("\n");
+    };
     const lines = [`<${label}>`, ""];
     let remaining = maxChars - label.length - 50;
     for (const conv of conversations) {
-      const path = getActivePath(conv);
       const title = conv.title ?? "Untitled";
       const header = `### ${title}
 `;
-      const body = path.messages.map((m) => {
-        const role = m.author?.role === "user" ? "User" : "Assistant";
-        let text = extractMessageText(m, fileExtMap).trim();
-        if (!text) return "";
-        let match;
-        imgPattern.lastIndex = 0;
-        while ((match = imgPattern.exec(text)) !== null) {
-          imageFileIds.push(match[1]);
+      let body;
+      if (includeAllBranches) {
+        const split = splitBranchesBySharedPrefix(conv);
+        if (!split) {
+          body = chatBranch ? formatChatBranch(getActivePath(conv).messages) : formatMessages(getActivePath(conv).messages);
+        } else {
+          const branchBlocks = split.branches.map((branch, i) => {
+            const messages = formatMessages(branch.messages);
+            if (!messages) return "";
+            const blabel = branch.isActive ? `#### Branch ${i + 1} (active)` : `#### Branch ${i + 1}`;
+            return `${blabel}
+${messages}`;
+          }).filter(Boolean).join("\n\n");
+          let sharedSection = "";
+          if (chatBranch) {
+            const forked = formatChatBranch(split.shared);
+            if (forked) sharedSection = forked;
+          } else {
+            const sharedBlock = formatMessages(split.shared);
+            if (sharedBlock) sharedSection = `#### Shared history
+${sharedBlock}`;
+          }
+          const parts = [
+            `_${split.count} regenerated branches preserved (shared history shown once)_`
+          ];
+          if (sharedSection) parts.push(sharedSection);
+          parts.push(branchBlocks);
+          body = parts.join("\n\n");
         }
-        text = text.replace(imgPattern, "[image attached separately]");
-        return `${role}: ${text}`;
-      }).filter(Boolean).join("\n");
+      } else if (chatBranch) {
+        body = formatChatBranch(getActivePath(conv).messages);
+      } else {
+        body = formatMessages(getActivePath(conv).messages);
+      }
       const entry = header + body + "\n\n";
-      if (entry.length > remaining) break;
+      if (entry.length > remaining) {
+        const marker = `_[Older messages truncated to fit the ${maxChars.toLocaleString()}-character limit \u2014 export the full chat for the complete history.]_
+
+`;
+        const budget = remaining - header.length - marker.length - 4;
+        if (budget > 500) {
+          lines.push(`${header}${marker}${keepTail(body, budget)}
+
+`);
+        }
+        break;
+      }
       lines.push(entry);
       remaining -= entry.length;
     }
@@ -778,12 +948,58 @@ ${ci.about_model}
     return { files, indexMarkdown, entries };
   }
   async function exportSingleConversation(session, conversationId, options = {}) {
-    return exportAllConversations(session, {
-      ...options,
-      conversationIds: [conversationId],
-      includeArchived: false,
-      includeProjects: false
-    });
+    const { downloadFiles = true, downloadImages = true, onProgress } = options;
+    const emit = (event) => onProgress?.(event);
+    emit({ phase: "downloading", message: "Downloading conversation\u2026", total: 1, current: 0 });
+    const conv = await fetchConversation(session, conversationId);
+    const files = /* @__PURE__ */ new Map();
+    const fileMeta = /* @__PURE__ */ new Map();
+    if (downloadFiles) {
+      const throttle = new Throttle(800);
+      const refs = extractFileReferences(conv).filter(
+        (ref) => ref.type === "image" ? downloadImages : true
+      );
+      for (const ref of refs) {
+        if (files.has(ref.fileId)) continue;
+        await throttle.wait();
+        try {
+          const downloaded = await downloadFile(session, ref);
+          if (downloaded) {
+            files.set(ref.fileId, downloaded.data);
+            fileMeta.set(ref.fileId, {
+              contentType: downloaded.contentType,
+              fileName: downloaded.fileName
+            });
+          }
+        } catch {
+        }
+      }
+    }
+    emit({ phase: "complete", message: "Export complete", current: 1, total: 1, conversationId });
+    const id = conv.conversation_id ?? conv.id ?? conversationId;
+    const index = [
+      {
+        id,
+        title: conv.title,
+        create_time: conv.create_time,
+        update_time: conv.update_time,
+        gizmo_id: conv.gizmo_id,
+        _archived: conv.is_archived === true ? true : void 0
+      }
+    ];
+    return {
+      conversations: [conv],
+      files,
+      fileMeta,
+      index,
+      stats: {
+        conversationCount: 1,
+        fileCount: files.size,
+        branchCount: countBranches(conv),
+        archivedCount: conv.is_archived === true ? 1 : 0,
+        projectCount: conv.gizmo_id ? 1 : 0
+      }
+    };
   }
 
   // node_modules/fflate/esm/browser.js
@@ -1498,6 +1714,50 @@ ${ci.about_model}
     const match = window.location.pathname.match(/\/c\/([a-f0-9-]+)/i);
     return match?.[1];
   }
+  function detectChatBranchFromDom() {
+    const candidates = Array.from(document.querySelectorAll("a, button, span, div"));
+    const divider = candidates.find((el) => {
+      const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+      return /^Branched from\b/i.test(text) && text.length < 160;
+    });
+    if (!divider) return null;
+    const label = (divider.textContent || "").replace(/\s+/g, " ").trim();
+    const all = Array.from(document.querySelectorAll("div[data-message-author-role], [data-message-author-role]"));
+    let passedDivider = false;
+    let firstUserText = "";
+    for (const el of all) {
+      if (divider === el || divider.contains(el) || el.contains(divider)) {
+        passedDivider = true;
+        continue;
+      }
+      const pos = divider.compareDocumentPosition(el);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) {
+        passedDivider = true;
+      }
+      if (!passedDivider && !(pos & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+      const role = el.getAttribute("data-message-author-role");
+      if (role === "user") {
+        firstUserText = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+        if (firstUserText) break;
+      }
+    }
+    if (!firstUserText) {
+      let node = divider.parentElement;
+      for (let depth = 0; depth < 6 && node; depth++, node = node.parentElement) {
+        let sib = node.nextElementSibling;
+        while (sib) {
+          const user = sib.querySelector?.('[data-message-author-role="user"]') || (sib.getAttribute?.("data-message-author-role") === "user" ? sib : null);
+          if (user) {
+            firstUserText = (user.innerText || user.textContent || "").replace(/\s+/g, " ").trim();
+            if (firstUserText) break;
+          }
+          sib = sib.nextElementSibling;
+        }
+        if (firstUserText) break;
+      }
+    }
+    return { label, firstUserText: firstUserText || void 0 };
+  }
   function downloadBlob(filename, blob) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1549,7 +1809,11 @@ ${ci.about_model}
       }
       if (ext) fileExtMap.set(fileId, ext);
     }
-    const contextBlock = toContextBlock(result.conversations, { maxChars: 6e4, fileExtMap });
+    const contextBlock = toContextBlock(result.conversations, {
+      maxChars: 6e4,
+      fileExtMap,
+      includeAllBranches: Boolean(extras.includeBranches)
+    });
     files["import-context-for-claude-gemini.md"] = contextBlock;
     const projectNames = new Set(
       layout.entries.filter((e) => e.projectName).map((e) => e.projectName)
@@ -1559,7 +1823,7 @@ ${ci.about_model}
         exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
         ...result.stats,
         tool: "chatliberate",
-        version: "0.1.2",
+        version: chrome.runtime.getManifest().version,
         accountType: document.cookie.includes("_account=") ? "teams/business" : "personal",
         memoriesCount: extras.memories?.length ?? 0,
         hasCustomInstructions: Boolean(extras.customInstructions?.about_user || extras.customInstructions?.about_model),
@@ -1623,7 +1887,11 @@ ${ci.about_model}
         }
       });
     }
-    const zip = await buildZip(result, { memories, customInstructions });
+    const zip = await buildZip(result, {
+      memories,
+      customInstructions,
+      includeBranches: options.includeBranches
+    });
     const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
     downloadBlob(`chatliberate-export-${date}.zip`, zip);
     return { ok: true, stats: { ...result.stats, memoriesCount: memories.length } };
@@ -1642,13 +1910,31 @@ ${ci.about_model}
       const ext = (meta.fileName ? meta.fileName.slice(meta.fileName.lastIndexOf(".")) : mime[meta.contentType?.split(";")[0].trim()]) ?? "";
       if (ext) fileExtMap.set(fileId, ext);
     }
+    const chatBranch = detectChatBranchFromDom();
     const context = toContextBlock(result.conversations, {
       maxChars: 12e4,
-      fileExtMap
+      fileExtMap,
+      includeAllBranches: Boolean(options?.includeBranches),
+      chatBranch: chatBranch || void 0
     });
     const imgPattern = /\[image attached separately\]/g;
     const imageCount = (context.match(imgPattern) || []).length;
-    return { ok: true, context, imageCount };
+    const branchCount = result.conversations.reduce(
+      (n, c) => n + (options?.includeBranches ? countBranches(c) : 1),
+      0
+    );
+    const dagBranches = options?.includeBranches && context.includes("regenerated branches preserved");
+    const chatFork = Boolean(chatBranch) && context.includes("Shared history (before branch)");
+    return {
+      ok: true,
+      context,
+      imageCount,
+      includeAllBranches: Boolean(options?.includeBranches),
+      branchNote: dagBranches || chatFork,
+      branchCount: dagBranches ? branchCount : chatFork ? 2 : branchCount,
+      chatFork,
+      chatBranchLabel: chatBranch?.label
+    };
   }
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === "CHATLIBERATE_EXPORT") {

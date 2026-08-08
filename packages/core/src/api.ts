@@ -459,10 +459,67 @@ export async function exportSingleConversation(
   conversationId: string,
   options: Pick<ExportOptions, 'downloadFiles' | 'downloadImages' | 'onProgress'> = {},
 ): Promise<ExportResult> {
-  return exportAllConversations(session, {
-    ...options,
-    conversationIds: [conversationId],
-    includeArchived: false,
-    includeProjects: false,
-  });
+  const { downloadFiles = true, downloadImages = true, onProgress } = options;
+  const emit = (event: ExportProgressEvent) => onProgress?.(event);
+
+  // Fetch the one conversation directly — no need to index the whole account,
+  // and /conversation/{id} works for archived and Project chats too.
+  emit({ phase: 'downloading', message: 'Downloading conversation…', total: 1, current: 0 });
+
+  const conv = await fetchConversation(session, conversationId);
+
+  const files = new Map<string, Uint8Array>();
+  const fileMeta = new Map<string, { contentType: string; fileName?: string }>();
+
+  if (downloadFiles) {
+    const throttle = new Throttle(800);
+    const refs = extractFileReferences(conv).filter((ref) =>
+      ref.type === 'image' ? downloadImages : true,
+    );
+
+    for (const ref of refs) {
+      if (files.has(ref.fileId)) continue;
+      await throttle.wait();
+      try {
+        const downloaded = await downloadFile(session, ref);
+        if (downloaded) {
+          files.set(ref.fileId, downloaded.data);
+          fileMeta.set(ref.fileId, {
+            contentType: downloaded.contentType,
+            fileName: downloaded.fileName,
+          });
+        }
+      } catch {
+        // Skip individual file failures
+      }
+    }
+  }
+
+  emit({ phase: 'complete', message: 'Export complete', current: 1, total: 1, conversationId });
+
+  const id = conv.conversation_id ?? conv.id ?? conversationId;
+  const index: ConversationSummary[] = [
+    {
+      id,
+      title: conv.title,
+      create_time: conv.create_time,
+      update_time: conv.update_time,
+      gizmo_id: conv.gizmo_id,
+      _archived: conv.is_archived === true ? true : undefined,
+    },
+  ];
+
+  return {
+    conversations: [conv],
+    files,
+    fileMeta,
+    index,
+    stats: {
+      conversationCount: 1,
+      fileCount: files.size,
+      branchCount: countBranches(conv),
+      archivedCount: conv.is_archived === true ? 1 : 0,
+      projectCount: conv.gizmo_id ? 1 : 0,
+    },
+  };
 }

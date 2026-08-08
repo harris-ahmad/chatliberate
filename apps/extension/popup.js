@@ -36,7 +36,7 @@ async function init() {
   if (stored.exportProgress?.downloadedIds?.length) {
     const count = stored.exportProgress.downloadedIds.length;
     clearResumeBtn.classList.remove('hidden');
-    clearResumeBtn.textContent = `Resume from ${count} already downloaded — or clear`;
+    clearResumeBtn.textContent = `Clear saved progress from last export (${count} chats)`;
   }
 }
 
@@ -124,10 +124,17 @@ copyContextBtn.addEventListener('click', async () => {
 
     const chars = response.context.length.toLocaleString();
     copyContextBtn.textContent = '✓ Copied!';
-    const imgNote = response.imageCount
-      ? ` (${response.imageCount} images — upload from ZIP separately)`
-      : '';
-    statusEl.textContent = `✓ Copied ${chars} chars${imgNote}`;
+    const bits = [];
+    if (response.chatFork) {
+      bits.push('branched-from split');
+    } else if (response.includeAllBranches) {
+      if (response.branchNote) bits.push(`${response.branchCount} regenerated branches`);
+      else bits.push('1 path — no regenerate forks (try Branch-in-new-chat divider or Regenerate 1/2)');
+    } else {
+      bits.push('active path only');
+    }
+    if (response.imageCount) bits.push(`${response.imageCount} images — upload from ZIP separately`);
+    statusEl.textContent = `✓ Copied ${chars} chars (${bits.join('; ')})`;
     setTimeout(() => {
       copyContextBtn.textContent = '⎘ Copy';
       copyContextBtn.disabled = false;
