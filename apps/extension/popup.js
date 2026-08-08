@@ -7,6 +7,7 @@ const clearResumeBtn = document.getElementById('clearResume');
 const progressEl = document.getElementById('progress');
 const barFill = document.getElementById('barFill');
 const progressText = document.getElementById('progressText');
+const bgHint = document.getElementById('bgHint');
 
 let activeTab = null;
 
@@ -67,6 +68,8 @@ async function sendExport(mode) {
   exportAllBtn.disabled = true;
   exportCurrentBtn.disabled = true;
   showProgress('Starting export…', 5);
+  // "Export All" can take minutes — let the user know it survives closing the popup.
+  bgHint.classList.toggle('hidden', mode !== 'all');
 
   try {
     const response = await chrome.tabs.sendMessage(activeTab.id, {
@@ -80,6 +83,7 @@ async function sendExport(mode) {
     }
 
     showProgress('Download started!', 100);
+    bgHint.classList.add('hidden');
     statusEl.className = 'status ok';
     const memNote = response.stats.memoriesCount ? ` + ${response.stats.memoriesCount} memories` : '';
     statusEl.textContent = `✓ Exported ${response.stats.conversationCount} conversations${memNote}`;
@@ -87,6 +91,7 @@ async function sendExport(mode) {
     statusEl.className = 'status error';
     statusEl.textContent = err.message;
     showProgress('Export failed', 0);
+    bgHint.classList.add('hidden');
   } finally {
     exportAllBtn.disabled = false;
     exportCurrentBtn.disabled = !activeTab?.url?.includes('/c/');

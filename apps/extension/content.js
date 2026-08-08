@@ -1956,8 +1956,15 @@ ${ci.about_model}
     const zipped = zipSync(zipInput, { level: 0 });
     return new Blob([zipped], { type: "application/zip" });
   }
+  function broadcast(payload) {
+    try {
+      chrome.runtime.sendMessage(payload)?.catch?.(() => {
+      });
+    } catch {
+    }
+  }
   function sendProgress(event) {
-    chrome.runtime.sendMessage({
+    broadcast({
       type: "CHATLIBERATE_PROGRESS",
       message: event.message,
       current: event.current,
@@ -2045,7 +2052,13 @@ ${ci.about_model}
   }
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === "CHATLIBERATE_EXPORT") {
-      runExport(msg.mode, msg.options).then((result) => sendResponse(result)).catch((err2) => sendResponse({ ok: false, error: err2.message }));
+      runExport(msg.mode, msg.options).then((result) => {
+        broadcast({ type: "CHATLIBERATE_DONE", stats: result.stats });
+        sendResponse(result);
+      }).catch((err2) => {
+        broadcast({ type: "CHATLIBERATE_ERROR", error: err2.message });
+        sendResponse({ ok: false, error: err2.message });
+      });
       return true;
     }
     if (msg.type === "CHATLIBERATE_COPY_CONTEXT") {

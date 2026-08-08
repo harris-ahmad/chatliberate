@@ -280,8 +280,18 @@ async function buildZip(result, extras = {}) {
   return new Blob([zipped], { type: 'application/zip' });
 }
 
+// Broadcast to the popup (if open) and the background worker (badge). Swallow
+// "no receiver" rejections — they're expected when the popup is closed.
+function broadcast(payload) {
+  try {
+    chrome.runtime.sendMessage(payload)?.catch?.(() => {});
+  } catch {
+    // ignore
+  }
+}
+
 function sendProgress(event) {
-  chrome.runtime.sendMessage({
+  broadcast({
     type: 'CHATLIBERATE_PROGRESS',
     message: event.message,
     current: event.current,
@@ -393,8 +403,15 @@ async function copyContextForCurrent(options) {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'CHATLIBERATE_EXPORT') {
     runExport(msg.mode, msg.options)
-      .then((result) => sendResponse(result))
-      .catch((err) => sendResponse({ ok: false, error: err.message }));
+      .then((result) => {
+        // Tell the background worker so the badge resolves even if the popup is closed.
+        broadcast({ type: 'CHATLIBERATE_DONE', stats: result.stats });
+        sendResponse(result);
+      })
+      .catch((err) => {
+        broadcast({ type: 'CHATLIBERATE_ERROR', error: err.message });
+        sendResponse({ ok: false, error: err.message });
+      });
     return true;
   }
 
