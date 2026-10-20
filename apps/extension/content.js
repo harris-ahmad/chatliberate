@@ -4,8 +4,14 @@
   var KNOWN_HOSTS = ["chatgpt.com", "chat.openai.com"];
   function getApiBase() {
     const origin = typeof location !== "undefined" && location?.origin ? location.origin : "";
-    if (origin && KNOWN_HOSTS.some((host) => origin.endsWith(host))) {
-      return `${origin}/backend-api`;
+    if (origin) {
+      try {
+        const { hostname } = new URL(origin);
+        if (KNOWN_HOSTS.includes(hostname)) {
+          return `${origin}/backend-api`;
+        }
+      } catch {
+      }
     }
     return DEFAULT_API_BASE;
   }
@@ -875,9 +881,10 @@ ${sharedBlock}`;
     const metaResponse = await fetchWithRetry(metaUrl, { headers: createHeaders(session) });
     const meta = await metaResponse.json();
     if (meta.status !== "success" || !meta.download_url) return null;
-    const fileResponse = await fetchWithRetry(meta.download_url, {
-      headers: createHeaders(session)
-    });
+    const downloadUrl = new URL(meta.download_url, getApiBase());
+    const apiOrigin = new URL(getApiBase()).origin;
+    const headers = downloadUrl.origin === apiOrigin ? createHeaders(session) : {};
+    const fileResponse = await fetchWithRetry(meta.download_url, { headers });
     const buffer = new Uint8Array(await fileResponse.arrayBuffer());
     return {
       data: buffer,

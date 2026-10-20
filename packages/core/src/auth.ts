@@ -13,8 +13,15 @@ const KNOWN_HOSTS = ['chatgpt.com', 'chat.openai.com'];
 export function getApiBase(): string {
   const origin =
     typeof location !== 'undefined' && location?.origin ? location.origin : '';
-  if (origin && KNOWN_HOSTS.some((host) => origin.endsWith(host))) {
-    return `${origin}/backend-api`;
+  if (origin) {
+    try {
+      const { hostname } = new URL(origin);
+      if (KNOWN_HOSTS.includes(hostname)) {
+        return `${origin}/backend-api`;
+      }
+    } catch {
+      // Fall through to default.
+    }
   }
   return DEFAULT_API_BASE;
 }

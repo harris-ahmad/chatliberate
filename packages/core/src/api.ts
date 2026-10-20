@@ -310,9 +310,15 @@ async function downloadFile(
 
   if (meta.status !== 'success' || !meta.download_url) return null;
 
-  const fileResponse = await fetchWithRetry(meta.download_url, {
-    headers: createHeaders(session),
-  });
+  // Only send the Bearer token to the ChatGPT API origin. download_url often
+  // points at a pre-signed (SAS) URL on files.oaiusercontent.com / Azure Blob,
+  // where the token is redundant and would leak the session JWT onto a
+  // cross-origin request.
+  const downloadUrl = new URL(meta.download_url, getApiBase());
+  const apiOrigin = new URL(getApiBase()).origin;
+  const headers = downloadUrl.origin === apiOrigin ? createHeaders(session) : {};
+
+  const fileResponse = await fetchWithRetry(meta.download_url, { headers });
 
   const buffer = new Uint8Array(await fileResponse.arrayBuffer());
   return {
